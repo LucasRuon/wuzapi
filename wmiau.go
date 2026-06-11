@@ -338,6 +338,88 @@ func parseJID(arg string) (types.JID, bool) {
 	}
 }
 
+// brazilianMobileVariants gera as variantes "com" e "sem" o nono dígito para um
+// número de celular brasileiro (formato 55 + DDD + número). O primeiro elemento é
+// sempre o número original (preferência quando ambas as variantes existem).
+// Retorna nil quando o número não é um celular brasileiro elegível à regra do
+// nono dígito (não-BR, fixo, ou tamanho inválido).
+func brazilianMobileVariants(digits string) []string {
+	if !strings.HasPrefix(digits, "55") {
+		return nil
+	}
+	rest := digits[2:]
+	// DDD (2 dígitos) + número local (8 sem o 9, ou 9 com o 9)
+	if len(rest) < 10 || len(rest) > 11 {
+		return nil
+	}
+	ddd := rest[:2]
+	local := rest[2:]
+	switch len(local) {
+	case 9: // já tem o nono dígito (9XXXXXXXX): também tenta sem o 9
+		if local[0] != '9' {
+			return nil
+		}
+		return []string{digits, "55" + ddd + local[1:]}
+	case 8: // sem o nono dígito: tenta também com o 9 (apenas faixas de celular 6-9)
+		if local[0] < '6' {
+			return nil // fixo (2-5) não recebe nono dígito
+		}
+		return []string{digits, "55" + ddd + "9" + local}
+	}
+	return nil
+}
+
+// normalizeBrazilianJID resolve o nono dígito de um celular brasileiro consultando
+// o WhatsApp (IsOnWhatsApp) e retornando o JID canônico realmente registrado.
+// Faz fallback para o recipient original sempre que não houver o que resolver, a
+// consulta falhar, ou nenhuma variante estiver registrada — nunca piora o envio.
+func normalizeBrazilianJID(client *whatsmeow.Client, recipient types.JID) types.JID {
+	// Só normaliza números de usuário comuns; ignora grupos, newsletters, LIDs etc.
+	if recipient.Server != types.DefaultUserServer {
+		return recipient
+	}
+
+	digits := recipient.User
+	variants := brazilianMobileVariants(digits)
+	if variants == nil || client == nil {
+		return recipient
+	}
+
+	if cached, ok := phoneJIDCache.Get(digits); ok {
+		return cached.(types.JID)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, err := client.IsOnWhatsApp(ctx, variants)
+	if err != nil {
+		log.Warn().Err(err).Str("phone", digits).Msg("phone normalization: IsOnWhatsApp falhou, enviando como veio")
+		return recipient
+	}
+
+	var resolved *types.JID
+	for _, item := range resp {
+		if !item.IsIn || item.JID.User == "" {
+			continue
+		}
+		j := types.NewJID(item.JID.User, types.DefaultUserServer)
+		if item.JID.User == digits {
+			resolved = &j // bateu com o número original: preferência máxima
+			break
+		}
+		if resolved == nil {
+			resolved = &j
+		}
+	}
+
+	if resolved == nil {
+		return recipient // nenhuma variante registrada: fallback
+	}
+
+	phoneJIDCache.Set(digits, *resolved, cache.DefaultExpiration)
+	return *resolved
+}
+
 // getPlatformTypeEnum converts a platform type string to the corresponding DeviceProps enum
 // Returns DESKTOP as default if the string doesn't match any known type
 func getPlatformTypeEnum(platformType string) *waCompanionReg.DeviceProps_PlatformType {
@@ -1566,6 +1648,33 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		postmap["type"] = "FBMessage"
 		dowebhook = 1
 		log.Info().Str("info", evt.Info.SourceString()).Msg("Facebook message received")
+	case *events.LabelEdit:
+		// A label was created/renamed/recolored/deleted on any device (CRM F42 —
+		// reconciliation EWC−06). Dispatch the id + new info so the CRM keeps its
+		// per-corretor label mirror in sync (reuse ids, respect the cap).
+		postmap["type"] = "LabelEdit"
+		postmap["labelID"] = evt.LabelID
+		if evt.Action != nil {
+			postmap["name"] = evt.Action.GetName()
+			postmap["color"] = evt.Action.GetColor()
+			postmap["deleted"] = evt.Action.GetDeleted()
+			postmap["predefinedID"] = evt.Action.GetPredefinedID()
+			postmap["isActive"] = evt.Action.GetIsActive()
+		}
+		dowebhook = 1
+		log.Info().Str("labelID", evt.LabelID).Msg("Label edited")
+	case *events.LabelAssociationChat:
+		// A chat (contact) was labeled/unlabeled on any device (CRM F42). Carry the
+		// chat JID + label id + labeled flag so the CRM at least ensures the label
+		// exists in the mirror (and can observe manual (un)labeling).
+		postmap["type"] = "LabelAssociationChat"
+		postmap["labelID"] = evt.LabelID
+		postmap["jid"] = evt.JID.String()
+		if evt.Action != nil {
+			postmap["labeled"] = evt.Action.GetLabeled()
+		}
+		dowebhook = 1
+		log.Info().Str("labelID", evt.LabelID).Str("jid", evt.JID.String()).Msg("Label association (chat) changed")
 	default:
 		log.Warn().Str("event", fmt.Sprintf("%+v", evt)).Msg("Unhandled event")
 	}

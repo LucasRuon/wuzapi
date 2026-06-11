@@ -71,6 +71,10 @@ var supportedEventTypes = []string{
 	// Facebook/Meta Bridge
 	"FBMessage",
 
+	// Labels (WhatsApp Business — CRM F42 reconciliation)
+	"LabelEdit",
+	"LabelAssociationChat",
+
 	// Special - receives all events
 	"All",
 }
