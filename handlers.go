@@ -2848,7 +2848,7 @@ func (s *server) DeleteMessage() http.HandlerFunc {
 
 		msgid = t.Id
 
-		recipient, ok := parseJID(t.Phone)
+		recipient, ok := parseJIDNormalized(clientManager.GetWhatsmeowClient(txtid), t.Phone)
 		if !ok {
 			s.Respond(w, r, http.StatusBadRequest, errors.New("could not parse Phone"))
 			return
@@ -3141,7 +3141,7 @@ func (s *server) SendTemplate() http.HandlerFunc {
 			return
 		}
 
-		recipient, ok := parseJID(t.Phone)
+		recipient, ok := parseJIDNormalized(clientManager.GetWhatsmeowClient(txtid), t.Phone)
 		if !ok {
 			s.Respond(w, r, http.StatusBadRequest, errors.New("could not parse Phone"))
 			return
@@ -3463,7 +3463,7 @@ func (s *server) GetAvatar() http.HandlerFunc {
 			return
 		}
 
-		jid, ok := parseJID(t.Phone)
+		jid, ok := parseJIDNormalized(clientManager.GetWhatsmeowClient(txtid), t.Phone)
 		if !ok {
 			s.Respond(w, r, http.StatusBadRequest, errors.New("could not parse Phone"))
 			return
@@ -3561,7 +3561,7 @@ func (s *server) updateUserBlocklist(action events.BlocklistChangeAction) http.H
 			return
 		}
 
-		jid, ok := parseJID(target)
+		jid, ok := parseJIDNormalized(clientManager.GetWhatsmeowClient(txtid), target)
 		if !ok {
 			s.Respond(w, r, http.StatusBadRequest, errors.New("could not parse Phone or JID"))
 			return
@@ -3751,7 +3751,7 @@ func (s *server) ChatPresence() http.HandlerFunc {
 			return
 		}
 
-		jid, ok := parseJID(t.Phone)
+		jid, ok := parseJIDNormalized(clientManager.GetWhatsmeowClient(txtid), t.Phone)
 		if !ok {
 			s.Respond(w, r, http.StatusBadRequest, errors.New("could not parse Phone"))
 			return
@@ -4130,7 +4130,7 @@ func (s *server) React() http.HandlerFunc {
 			return
 		}
 
-		recipient, ok := parseJID(t.Phone)
+		recipient, ok := parseJIDNormalized(clientManager.GetWhatsmeowClient(txtid), t.Phone)
 		if !ok {
 			s.Respond(w, r, http.StatusBadRequest, errors.New("could not parse Group JID"))
 			return
@@ -4155,7 +4155,7 @@ func (s *server) React() http.HandlerFunc {
 
 		var participantJID types.JID
 		if !fromMe && t.Participant != "" {
-			if pj, ok := parseJID(t.Participant); ok {
+			if pj, ok := parseJIDNormalized(clientManager.GetWhatsmeowClient(txtid), t.Participant); ok {
 				participantJID = pj
 			}
 		}
@@ -4229,7 +4229,7 @@ func (s *server) MarkRead() http.HandlerFunc {
 
 		if len(t.ChatPhone) > 0 {
 			var ok bool
-			jidChat, ok = parseJID(t.ChatPhone)
+			jidChat, ok = parseJIDNormalized(clientManager.GetWhatsmeowClient(txtid), t.ChatPhone)
 			if !ok {
 				s.Respond(w, r, http.StatusBadRequest, errors.New("could not parse ChatPhone"))
 				return
@@ -4245,7 +4245,7 @@ func (s *server) MarkRead() http.HandlerFunc {
 
 		if len(t.SenderPhone) > 0 {
 			var ok bool
-			jidSender, ok = parseJID(t.SenderPhone)
+			jidSender, ok = parseJIDNormalized(clientManager.GetWhatsmeowClient(txtid), t.SenderPhone)
 			if !ok {
 				s.Respond(w, r, http.StatusBadRequest, errors.New("could not parse SenderPhone"))
 				return
@@ -4521,7 +4521,7 @@ func (s *server) CreateGroup() http.HandlerFunc {
 		participantJIDs := make([]types.JID, len(t.Participants))
 		var ok bool
 		for i, phone := range t.Participants {
-			participantJIDs[i], ok = parseJID(phone)
+			participantJIDs[i], ok = parseJIDNormalized(clientManager.GetWhatsmeowClient(txtid), phone)
 			if !ok {
 				s.Respond(w, r, http.StatusBadRequest, errors.New("could not parse Participant Phone"))
 				return
@@ -4769,10 +4769,11 @@ func (s *server) UpdateGroupParticipants() http.HandlerFunc {
 			s.Respond(w, r, http.StatusBadRequest, errors.New("missing Phone in Payload"))
 			return
 		}
-		// parse phone numbers
+		// parse phone numbers (normaliza o nono dígito BR para casar com o
+		// participante real do grupo)
 		phoneParsed := make([]types.JID, len(t.Phone))
 		for i, phone := range t.Phone {
-			phoneParsed[i], ok = parseJID(phone)
+			phoneParsed[i], ok = parseJIDNormalized(clientManager.GetWhatsmeowClient(txtid), phone)
 			if !ok {
 				s.Respond(w, r, http.StatusBadRequest, errors.New("could not parse Phone"))
 				return
@@ -5974,7 +5975,9 @@ func (s *server) Respond(w http.ResponseWriter, r *http.Request, status int, dat
 // Validate message fields
 func validateMessageFields(txtid string, phone string, stanzaid *string, participant *string) (types.JID, error) {
 
-	recipient, ok := parseJID(phone)
+	// Resolve o nono dígito de celulares brasileiros (com/sem o 9) consultando o
+	// WhatsApp. Faz fallback para o recipient original em qualquer falha.
+	recipient, ok := parseJIDNormalized(clientManager.GetWhatsmeowClient(txtid), phone)
 	if !ok {
 		return types.NewJID("", types.DefaultUserServer), errors.New("could not parse Phone")
 	}
@@ -5990,10 +5993,6 @@ func validateMessageFields(txtid string, phone string, stanzaid *string, partici
 			return types.NewJID("", types.DefaultUserServer), errors.New("missing StanzaID in ContextInfo")
 		}
 	}
-
-	// Resolve o nono dígito de celulares brasileiros (com/sem o 9) consultando o
-	// WhatsApp. Faz fallback para o recipient original em qualquer falha.
-	recipient = normalizeBrazilianJID(clientManager.GetWhatsmeowClient(txtid), recipient)
 
 	return recipient, nil
 }
@@ -6876,7 +6875,7 @@ func (s *server) RejectCall() http.HandlerFunc {
 			return
 		}
 
-		callFrom, ok := parseJID(t.CallFrom)
+		callFrom, ok := parseJIDNormalized(clientManager.GetWhatsmeowClient(txtid), t.CallFrom)
 		if !ok {
 			s.Respond(w, r, http.StatusBadRequest, errors.New("could not parse call_from"))
 			return
@@ -6920,7 +6919,7 @@ func (s *server) GetUserLID() http.HandlerFunc {
 		}
 
 		// Parse the JID (phone number)
-		jid, ok := parseJID(jidParam)
+		jid, ok := parseJIDNormalized(clientManager.GetWhatsmeowClient(txtid), jidParam)
 		if !ok {
 			s.Respond(w, r, http.StatusBadRequest, errors.New("invalid jid format"))
 			return

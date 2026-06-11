@@ -108,10 +108,11 @@ func (s *server) UpdateGroupRequestParticipants() http.HandlerFunc {
 			return
 		}
 
-		// parse phone numbers
+		// parse phone numbers (normaliza o nono dígito BR para casar com o
+		// participante real do grupo)
 		phoneParsed := make([]types.JID, len(t.Phone))
 		for i, phone := range t.Phone {
-			phoneParsed[i], ok = parseJID(phone)
+			phoneParsed[i], ok = parseJIDNormalized(clientManager.GetWhatsmeowClient(txtid), phone)
 			if !ok {
 				s.Respond(w, r, http.StatusBadRequest, errors.New("could not parse Phone"))
 				return

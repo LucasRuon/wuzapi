@@ -338,6 +338,23 @@ func parseJID(arg string) (types.JID, bool) {
 	}
 }
 
+// parseJIDNormalized faz o parse de um número/JID recebido pela API e, em
+// seguida, resolve o nono dígito de celulares brasileiros (com/sem o 9)
+// consultando o WhatsApp, retornando o JID canônico realmente registrado.
+//
+// É um no-op seguro para grupos (@g.us), LIDs (@lid), newsletters e números
+// não-brasileiros — nesses casos o JID volta exatamente como veio. Use esta
+// função em vez de parseJID em qualquer rota que receba um número de usuário,
+// para manter a normalização do nono dígito consistente em toda a API e evitar
+// que o JID deixe de casar com o destinatário/participante real.
+func parseJIDNormalized(client *whatsmeow.Client, arg string) (types.JID, bool) {
+	recipient, ok := parseJID(arg)
+	if !ok {
+		return recipient, false
+	}
+	return normalizeBrazilianJID(client, recipient), true
+}
+
 // brazilianMobileVariants gera as variantes "com" e "sem" o nono dígito para um
 // número de celular brasileiro (formato 55 + DDD + número). O primeiro elemento é
 // sempre o número original (preferência quando ambas as variantes existem).
