@@ -7350,6 +7350,60 @@ func (s *server) LabelChat() http.HandlerFunc {
 
 }
 
+// ResyncLabels forces a full re-fetch of the regular app-state patch so WhatsApp
+// re-emits the corretor's existing LabelEdit/LabelAssociationChat events to the
+// labels webhook (CRM F44 — active read of the real labels before the engine
+// decides to create one, avoiding duplicates and the ~20-label ceiling).
+//
+// The regular patch is the one that carries labels (appstate.BuildLabelEdit /
+// BuildLabelChat encode into WAPatchRegular). fullSync=true discards the cached
+// version so every mutation is re-applied and re-dispatched; this relies on
+// EmitAppStateEventsOnFullSync=true being set on the client (see wmiau.go),
+// otherwise whatsmeow would only fire AppStateSyncComplete with no per-label
+// events. Best-effort on the CRM side: a 404/500 here degrades to the passive
+// mirror of F42.
+func (s *server) ResyncLabels() http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		txtid := r.Context().Value("userinfo").(Values).Get("Id")
+
+		client := clientManager.GetWhatsmeowClient(txtid)
+
+		if client == nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("no session"))
+			return
+		}
+
+		// A full app-state fetch needs the socket up; an unpaired/offline session
+		// has nothing to re-emit. Surface it so the CRM can degrade (best-effort).
+		if !client.IsConnected() {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("not connected"))
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		err := client.FetchAppState(ctx, appstate.WAPatchRegular, true, false)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("failed to resync labels: %s", err)))
+			return
+		}
+
+		response := map[string]interface{}{
+			"success": true,
+			"message": "Label resync requested",
+		}
+		responseJson, err := json.Marshal(response)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, err)
+		} else {
+			s.Respond(w, r, http.StatusOK, string(responseJson))
+		}
+	}
+
+}
+
 // Downloads Sticker and returns base64 representation
 func (s *server) DownloadSticker() http.HandlerFunc {
 

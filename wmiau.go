@@ -533,6 +533,13 @@ func (s *server) startClient(userID string, textjid string, token string, kill c
 		client = whatsmeow.NewClient(deviceStore, nil)
 	}
 
+	// Re-emit app-state events (LabelEdit/LabelAssociationChat) on a forced full
+	// sync (CRM F44 — active label read via FetchAppState). Without this flag
+	// whatsmeow suppresses per-mutation events when fullSync=true and only fires
+	// AppStateSyncComplete, so the resync endpoint would never re-feed the
+	// labels webhook. See whatsmeow appstate.go (EmitAppStateEventsOnFullSync).
+	client.EmitAppStateEventsOnFullSync = true
+
 	// Now we can use the client with the manager
 	clientManager.SetWhatsmeowClient(userID, client)
 
