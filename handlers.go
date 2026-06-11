@@ -7317,6 +7317,13 @@ func (s *server) LabelChat() http.HandlerFunc {
 			return
 		}
 
+		// Resolve o nono dígito de celulares BR antes de etiquetar: o JID que chega
+		// pode vir com ou sem o 9, mas a etiqueta só "cola" no JID canônico que o
+		// WhatsApp realmente usa para aquele contato. Reusa o mesmo resolvedor do
+		// envio (variantes + IsOnWhatsApp + cache); é no-op para não-BR/grupos e faz
+		// fallback seguro para o JID original quando não há o que resolver.
+		chatJID = normalizeBrazilianJID(client, chatJID)
+
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
