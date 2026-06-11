@@ -76,6 +76,9 @@ var (
 	killchannelMu    sync.Mutex
 	userinfocache    = cache.New(5*time.Minute, 10*time.Minute)
 	lastMessageCache = cache.New(24*time.Hour, 24*time.Hour)
+	// phoneJIDCache mapeia um número BR (somente dígitos) para o JID canônico
+	// resolvido pelo WhatsApp, evitando uma consulta IsOnWhatsApp a cada envio.
+	phoneJIDCache = cache.New(24*time.Hour, 1*time.Hour)
 	globalHTTPClient = newSafeHTTPClient()
 )
 
