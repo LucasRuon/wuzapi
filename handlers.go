@@ -17,8 +17,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -7457,6 +7459,220 @@ func (s *server) ApplyLabels() http.HandlerFunc {
 		}
 	}
 
+}
+
+type whatsAppLabel struct {
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	Color         int32    `json:"color"`
+	Deleted       bool     `json:"deleted"`
+	PredefinedID  int32    `json:"predefinedId"`
+	IsActive      bool     `json:"isActive"`
+	OrderIndex    int32    `json:"orderIndex"`
+	Type          string   `json:"type"`
+	IsImmutable   bool     `json:"isImmutable"`
+	MuteEndTimeMS int64    `json:"muteEndTimeMs"`
+	Timestamp     string   `json:"timestamp,omitempty"`
+	FromFullSync  bool     `json:"fromFullSync"`
+	ChatJIDs      []string `json:"chatJids,omitempty"`
+}
+
+type whatsAppLabelChatAssociation struct {
+	LabelID      string `json:"labelId"`
+	JID          string `json:"jid"`
+	Labeled      bool   `json:"labeled"`
+	Timestamp    string `json:"timestamp,omitempty"`
+	FromFullSync bool   `json:"fromFullSync"`
+}
+
+type whatsAppLabelListResponse struct {
+	Labels           []whatsAppLabel                `json:"labels"`
+	ChatAssociations []whatsAppLabelChatAssociation `json:"chatAssociations"`
+	Counts           map[string]int                 `json:"counts"`
+	SyncedAt         string                         `json:"syncedAt"`
+}
+
+type whatsAppLabelSnapshot struct {
+	labels           map[string]*whatsAppLabel
+	chatAssociations map[string]whatsAppLabelChatAssociation
+}
+
+func newWhatsAppLabelSnapshot() *whatsAppLabelSnapshot {
+	return &whatsAppLabelSnapshot{
+		labels:           make(map[string]*whatsAppLabel),
+		chatAssociations: make(map[string]whatsAppLabelChatAssociation),
+	}
+}
+
+func (snapshot *whatsAppLabelSnapshot) ensureLabel(labelID string) *whatsAppLabel {
+	label := snapshot.labels[labelID]
+	if label == nil {
+		label = &whatsAppLabel{ID: labelID}
+		snapshot.labels[labelID] = label
+	}
+	return label
+}
+
+func (snapshot *whatsAppLabelSnapshot) applyEvent(rawEvt interface{}) {
+	switch evt := rawEvt.(type) {
+	case *events.LabelEdit:
+		label := snapshot.ensureLabel(evt.LabelID)
+		label.Timestamp = evt.Timestamp.Format(time.RFC3339)
+		label.FromFullSync = evt.FromFullSync
+		if evt.Action != nil {
+			label.Name = evt.Action.GetName()
+			label.Color = evt.Action.GetColor()
+			label.Deleted = evt.Action.GetDeleted()
+			label.PredefinedID = evt.Action.GetPredefinedID()
+			label.IsActive = evt.Action.GetIsActive()
+			label.OrderIndex = evt.Action.GetOrderIndex()
+			label.Type = evt.Action.GetType().String()
+			label.IsImmutable = evt.Action.GetIsImmutable()
+			label.MuteEndTimeMS = evt.Action.GetMuteEndTimeMS()
+		}
+	case *events.LabelAssociationChat:
+		snapshot.ensureLabel(evt.LabelID)
+		association := whatsAppLabelChatAssociation{
+			LabelID:      evt.LabelID,
+			JID:          evt.JID.String(),
+			Timestamp:    evt.Timestamp.Format(time.RFC3339),
+			FromFullSync: evt.FromFullSync,
+		}
+		if evt.Action != nil {
+			association.Labeled = evt.Action.GetLabeled()
+		}
+		snapshot.chatAssociations[evt.LabelID+"\x00"+evt.JID.String()] = association
+	}
+}
+
+func (snapshot *whatsAppLabelSnapshot) buildResponse(includeDeleted, includeUnlabeled bool, syncedAt time.Time) whatsAppLabelListResponse {
+	activeChatJIDsByLabel := make(map[string][]string)
+	chatAssociations := make([]whatsAppLabelChatAssociation, 0, len(snapshot.chatAssociations))
+	for _, association := range snapshot.chatAssociations {
+		if association.Labeled {
+			activeChatJIDsByLabel[association.LabelID] = append(activeChatJIDsByLabel[association.LabelID], association.JID)
+		}
+		if includeUnlabeled || association.Labeled {
+			chatAssociations = append(chatAssociations, association)
+		}
+	}
+
+	sort.Slice(chatAssociations, func(i, j int) bool {
+		if chatAssociations[i].LabelID == chatAssociations[j].LabelID {
+			return chatAssociations[i].JID < chatAssociations[j].JID
+		}
+		return chatAssociations[i].LabelID < chatAssociations[j].LabelID
+	})
+
+	labels := make([]whatsAppLabel, 0, len(snapshot.labels))
+	for _, labelPtr := range snapshot.labels {
+		label := *labelPtr
+		if !includeDeleted && label.Deleted {
+			continue
+		}
+		label.ChatJIDs = activeChatJIDsByLabel[label.ID]
+		sort.Strings(label.ChatJIDs)
+		labels = append(labels, label)
+	}
+
+	sort.Slice(labels, func(i, j int) bool {
+		if labels[i].OrderIndex != labels[j].OrderIndex {
+			return labels[i].OrderIndex < labels[j].OrderIndex
+		}
+		if labels[i].Name != labels[j].Name {
+			return labels[i].Name < labels[j].Name
+		}
+		return labels[i].ID < labels[j].ID
+	})
+
+	return whatsAppLabelListResponse{
+		Labels:           labels,
+		ChatAssociations: chatAssociations,
+		Counts: map[string]int{
+			"labels":           len(labels),
+			"chatAssociations": len(chatAssociations),
+		},
+		SyncedAt: syncedAt.Format(time.RFC3339),
+	}
+}
+
+func queryBool(r *http.Request, key string) bool {
+	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get(key))) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// ListLabels fetches WhatsApp's current regular app-state snapshot and returns
+// label definitions plus chat associations in the response.
+func (s *server) ListLabels() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		txtid := r.Context().Value("userinfo").(Values).Get("Id")
+
+		client := clientManager.GetWhatsmeowClient(txtid)
+		if client == nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("no session"))
+			return
+		}
+		if !client.IsConnected() {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("not connected"))
+			return
+		}
+
+		includeDeleted := queryBool(r, "includeDeleted")
+		includeUnlabeled := queryBool(r, "includeUnlabeled")
+
+		originalEmitAppStateEventsOnFullSync := client.EmitAppStateEventsOnFullSync
+		client.EmitAppStateEventsOnFullSync = true
+		defer func() {
+			client.EmitAppStateEventsOnFullSync = originalEmitAppStateEventsOnFullSync
+		}()
+
+		snapshot := newWhatsAppLabelSnapshot()
+		var snapshotMu sync.Mutex
+		handlerID := client.AddEventHandler(func(rawEvt interface{}) {
+			switch rawEvt.(type) {
+			case *events.LabelEdit, *events.LabelAssociationChat:
+				snapshotMu.Lock()
+				snapshot.applyEvent(rawEvt)
+				snapshotMu.Unlock()
+			}
+		})
+		handlerRemoved := false
+		defer func() {
+			if !handlerRemoved {
+				client.RemoveEventHandler(handlerID)
+			}
+		}()
+
+		if mycli := clientManager.GetMyClient(txtid); mycli != nil {
+			mycli.labelListSyncs.Add(1)
+			defer mycli.labelListSyncs.Add(-1)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		err := client.FetchAppState(ctx, appstate.WAPatchRegular, true, false)
+		handlerRemoved = client.RemoveEventHandler(handlerID)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("failed to list labels: %s", err)))
+			return
+		}
+
+		snapshotMu.Lock()
+		response := snapshot.buildResponse(includeDeleted, includeUnlabeled, time.Now())
+		snapshotMu.Unlock()
+
+		responseJson, err := json.Marshal(response)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, err)
+		} else {
+			s.Respond(w, r, http.StatusOK, string(responseJson))
+		}
+	}
 }
 
 // ResyncLabels forces a full re-fetch of the regular app-state patch so WhatsApp

@@ -15,6 +15,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-resty/resty/v2"
@@ -41,6 +42,7 @@ type MyClient struct {
 	token          string
 	db             *sqlx.DB
 	s              *server
+	labelListSyncs atomic.Int32
 }
 
 // safeGo runs fn in a new goroutine with a defer recover so a panic inside
@@ -1019,24 +1021,24 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				}
 			}
 		}
-    
-    if encMessage := evt.Message.GetSecretEncryptedMessage(); encMessage != nil {
-        decrypted, derr := mycli.WAClient.DecryptSecretEncryptedMessage(context.Background(), evt)
-        if derr != nil {
-            log.Warn().
-                Err(derr).
-                Str("messageID", evt.Info.ID).
-                Str("secretEncType", encMessage.GetSecretEncType().String()).
-                Msg("DecryptSecretEncryptedMessage failed")
-        } else if decrypted != nil {
-            log.Info().
-                Str("messageID", evt.Info.ID).
-                Str("secretEncType", encMessage.GetSecretEncType().String()).
-                Msg("Decrypted secretEncryptedMessage; swapping evt.Message")
-                evt.Message = decrypted
-        }
-    }
-    
+
+		if encMessage := evt.Message.GetSecretEncryptedMessage(); encMessage != nil {
+			decrypted, derr := mycli.WAClient.DecryptSecretEncryptedMessage(context.Background(), evt)
+			if derr != nil {
+				log.Warn().
+					Err(derr).
+					Str("messageID", evt.Info.ID).
+					Str("secretEncType", encMessage.GetSecretEncType().String()).
+					Msg("DecryptSecretEncryptedMessage failed")
+			} else if decrypted != nil {
+				log.Info().
+					Str("messageID", evt.Info.ID).
+					Str("secretEncType", encMessage.GetSecretEncType().String()).
+					Msg("Decrypted secretEncryptedMessage; swapping evt.Message")
+				evt.Message = decrypted
+			}
+		}
+
 		if !*skipMedia {
 
 			isIncoming := !evt.Info.IsFromMe
@@ -1685,7 +1687,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			postmap["predefinedID"] = evt.Action.GetPredefinedID()
 			postmap["isActive"] = evt.Action.GetIsActive()
 		}
-		dowebhook = 1
+		if mycli.labelListSyncs.Load() == 0 {
+			dowebhook = 1
+		}
 		log.Info().Str("labelID", evt.LabelID).Msg("Label edited")
 	case *events.LabelAssociationChat:
 		// A chat (contact) was labeled/unlabeled on any device (CRM F42). Carry the
@@ -1697,7 +1701,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		if evt.Action != nil {
 			postmap["labeled"] = evt.Action.GetLabeled()
 		}
-		dowebhook = 1
+		if mycli.labelListSyncs.Load() == 0 {
+			dowebhook = 1
+		}
 		log.Info().Str("labelID", evt.LabelID).Str("jid", evt.JID.String()).Msg("Label association (chat) changed")
 	default:
 		log.Warn().Str("event", fmt.Sprintf("%+v", evt)).Msg("Unhandled event")
