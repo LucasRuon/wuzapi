@@ -7350,6 +7350,115 @@ func (s *server) LabelChat() http.HandlerFunc {
 
 }
 
+// ApplyLabels applies several WhatsApp Business label mutations as a SINGLE
+// app-state patch (CRM F42 — fix "2nd label discarded"). The CRM used to issue
+// one /chat/label/edit + /chat/label/chat per label; back-to-back SendAppState
+// calls race the background FetchAppState whatsmeow fires on each server_sync
+// notification (appstate.go reads GetAppStateVersion without appStateSyncLock),
+// so the 2nd+ mutation hit a 409 and was dropped after the single internal retry.
+// Every label mutation targets WAPatchRegular, so we batch them into one PatchInfo
+// with N Mutations → one version bump, one notification, no inter-op race.
+// Mutations are applied IN ORDER, so a LabelEdit that creates an id must precede
+// the LabelChat that references it (the CRM builds them in that order).
+func (s *server) ApplyLabels() http.HandlerFunc {
+
+	type labelMutation struct {
+		Type string `json:"type"` // "edit" | "chat"
+		// edit fields:
+		Id      string `json:"id"`
+		Name    string `json:"name"`
+		Color   int32  `json:"color"`
+		Deleted bool   `json:"deleted"`
+		// chat fields:
+		Jid     string `json:"jid"`
+		LabelId string `json:"labelId"`
+		Labeled bool   `json:"labeled"`
+	}
+
+	type requestApplyLabelsStruct struct {
+		Mutations []labelMutation `json:"mutations"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		txtid := r.Context().Value("userinfo").(Values).Get("Id")
+
+		client := clientManager.GetWhatsmeowClient(txtid)
+
+		if client == nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("no session"))
+			return
+		}
+
+		decoder := json.NewDecoder(r.Body)
+		var t requestApplyLabelsStruct
+		err := decoder.Decode(&t)
+		if err != nil {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("could not decode Payload"))
+			return
+		}
+
+		if len(t.Mutations) == 0 {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("missing mutations in Payload"))
+			return
+		}
+
+		patch := appstate.PatchInfo{Type: appstate.WAPatchRegular}
+		for i, m := range t.Mutations {
+			switch m.Type {
+			case "edit":
+				if m.Id == "" {
+					s.Respond(w, r, http.StatusBadRequest, errors.New(fmt.Sprintf("missing id in mutation %d", i)))
+					return
+				}
+				patch.Mutations = append(patch.Mutations, appstate.BuildLabelEdit(m.Id, m.Name, m.Color, m.Deleted).Mutations...)
+			case "chat":
+				if m.Jid == "" {
+					s.Respond(w, r, http.StatusBadRequest, errors.New(fmt.Sprintf("missing jid in mutation %d", i)))
+					return
+				}
+				if m.LabelId == "" {
+					s.Respond(w, r, http.StatusBadRequest, errors.New(fmt.Sprintf("missing labelId in mutation %d", i)))
+					return
+				}
+				chatJID, err := types.ParseJID(m.Jid)
+				if err != nil {
+					s.Respond(w, r, http.StatusBadRequest, errors.New(fmt.Sprintf("invalid Chat JID in mutation %d", i)))
+					return
+				}
+				// Same nono-dígito resolution as the single-label path so the label
+				// sticks on the canonical JID WhatsApp uses for the contact.
+				chatJID = normalizeBrazilianJID(client, chatJID)
+				patch.Mutations = append(patch.Mutations, appstate.BuildLabelChat(chatJID, m.LabelId, m.Labeled).Mutations...)
+			default:
+				s.Respond(w, r, http.StatusBadRequest, errors.New(fmt.Sprintf("unknown mutation type %q at %d", m.Type, i)))
+				return
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		err = client.SendAppState(ctx, patch)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("failed to apply labels: %s", err)))
+			return
+		}
+
+		response := map[string]interface{}{
+			"success": true,
+			"message": "Labels applied",
+			"count":   len(patch.Mutations),
+		}
+		responseJson, err := json.Marshal(response)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, err)
+		} else {
+			s.Respond(w, r, http.StatusOK, string(responseJson))
+		}
+	}
+
+}
+
 // ResyncLabels forces a full re-fetch of the regular app-state patch so WhatsApp
 // re-emits the corretor's existing LabelEdit/LabelAssociationChat events to the
 // labels webhook (CRM F44 — active read of the real labels before the engine
