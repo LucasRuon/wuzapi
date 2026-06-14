@@ -1686,6 +1686,11 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			postmap["deleted"] = evt.Action.GetDeleted()
 			postmap["predefinedID"] = evt.Action.GetPredefinedID()
 			postmap["isActive"] = evt.Action.GetIsActive()
+			// Native label type (UNREAD/FAVORITES/GROUPS/CUSTOM/NONE). The CRM filters
+			// the native system labels out of its mirror by this — same source the
+			// /chat/label/list snapshot uses (Action.GetType()), so the webhook and the
+			// synchronous read never disagree on what a label IS.
+			postmap["labelType"] = evt.Action.GetType().String()
 		}
 		if mycli.labelListSyncs.Load() == 0 {
 			dowebhook = 1
