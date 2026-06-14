@@ -33,6 +33,7 @@ import (
 
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waSyncAction"
 
 	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/types"
@@ -7214,6 +7215,34 @@ func (s *server) ArchiveChat() http.HandlerFunc {
 
 }
 
+// buildActiveLabelEdit monta o mesmo app-state mutation que appstate.BuildLabelEdit,
+// porém com IsActive=true e Type=CUSTOM. O WhatsApp Business só RENDERIZA as
+// associações (etiqueta↔contato) de uma etiqueta isActive:true; o helper do
+// whatsmeow omite esse campo (fica false), então as etiquetas criadas pela API
+// apareciam apenas na LISTA de etiquetas, nunca coladas no contato. Espelha o que
+// o app oficial envia ao criar/editar uma etiqueta de negócio.
+func buildActiveLabelEdit(labelID, labelName string, labelColor int32, deleted bool) appstate.PatchInfo {
+	labelType := waSyncAction.LabelEditAction_CUSTOM
+	return appstate.PatchInfo{
+		Type: appstate.WAPatchRegular,
+		Mutations: []appstate.MutationInfo{
+			{
+				Index:   []string{appstate.IndexLabelEdit, labelID},
+				Version: 3,
+				Value: &waSyncAction.SyncActionValue{
+					LabelEditAction: &waSyncAction.LabelEditAction{
+						Name:     proto.String(labelName),
+						Color:    proto.Int32(labelColor),
+						Deleted:  proto.Bool(deleted),
+						IsActive: proto.Bool(true),
+						Type:     &labelType,
+					},
+				},
+			},
+		},
+	}
+}
+
 // EditLabel creates, edits or deletes a WhatsApp Business label (app-state patch).
 // To create a new label, send an unused id with a name and color.
 func (s *server) EditLabel() http.HandlerFunc {
@@ -7252,7 +7281,7 @@ func (s *server) EditLabel() http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		err = client.SendAppState(ctx, appstate.BuildLabelEdit(t.Id, t.Name, t.Color, t.Deleted))
+		err = client.SendAppState(ctx, buildActiveLabelEdit(t.Id, t.Name, t.Color, t.Deleted))
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("failed to edit label: %s", err)))
 			return
@@ -7412,7 +7441,7 @@ func (s *server) ApplyLabels() http.HandlerFunc {
 					s.Respond(w, r, http.StatusBadRequest, errors.New(fmt.Sprintf("missing id in mutation %d", i)))
 					return
 				}
-				patch.Mutations = append(patch.Mutations, appstate.BuildLabelEdit(m.Id, m.Name, m.Color, m.Deleted).Mutations...)
+				patch.Mutations = append(patch.Mutations, buildActiveLabelEdit(m.Id, m.Name, m.Color, m.Deleted).Mutations...)
 			case "chat":
 				if m.Jid == "" {
 					s.Respond(w, r, http.StatusBadRequest, errors.New(fmt.Sprintf("missing jid in mutation %d", i)))
