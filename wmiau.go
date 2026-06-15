@@ -439,6 +439,34 @@ func normalizeBrazilianJID(client *whatsmeow.Client, recipient types.JID) types.
 	return *resolved
 }
 
+// resolveLabelTargetJID resolve o JID-alvo para etiquetar um chat. O WhatsApp
+// Business indexa as associacoes de etiqueta de um contato pelo LID (@lid), NAO
+// pelo numero de telefone (@s.whatsapp.net): uma etiqueta aplicada no phone JID
+// e gravada no app-state mas nao aparece no contato. Primeiro normaliza o nono
+// digito (mesmo resolvedor do envio) e depois mapeia o telefone -> LID via
+// Store.LIDs. Fallback seguro para o phone JID quando nao ha LID conhecido, a
+// consulta falha, ou o alvo nao e um numero de usuario (grupo/newsletter/ja-LID).
+func resolveLabelTargetJID(client *whatsmeow.Client, recipient types.JID) types.JID {
+	pnJID := normalizeBrazilianJID(client, recipient)
+	if client == nil || client.Store == nil || client.Store.LIDs == nil {
+		return pnJID
+	}
+	if pnJID.Server != types.DefaultUserServer {
+		return pnJID
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	lid, err := client.Store.LIDs.GetLIDForPN(ctx, pnJID)
+	if err != nil {
+		log.Warn().Err(err).Str("jid", pnJID.String()).Msg("label: GetLIDForPN falhou, etiquetando no phone JID")
+		return pnJID
+	}
+	if lid.IsEmpty() || lid.User == "" {
+		return pnJID
+	}
+	return lid
+}
+
 // getPlatformTypeEnum converts a platform type string to the corresponding DeviceProps enum
 // Returns DESKTOP as default if the string doesn't match any known type
 func getPlatformTypeEnum(platformType string) *waCompanionReg.DeviceProps_PlatformType {

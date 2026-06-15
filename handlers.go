@@ -7360,7 +7360,7 @@ func (s *server) LabelChat() http.HandlerFunc {
 		// WhatsApp realmente usa para aquele contato. Reusa o mesmo resolvedor do
 		// envio (variantes + IsOnWhatsApp + cache); é no-op para não-BR/grupos e faz
 		// fallback seguro para o JID original quando não há o que resolver.
-		chatJID = normalizeBrazilianJID(client, chatJID)
+		chatJID = resolveLabelTargetJID(client, chatJID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -7465,7 +7465,7 @@ func (s *server) ApplyLabels() http.HandlerFunc {
 				}
 				// Same nono-dígito resolution as the single-label path so the label
 				// sticks on the canonical JID WhatsApp uses for the contact.
-				chatJID = normalizeBrazilianJID(client, chatJID)
+				chatJID = resolveLabelTargetJID(client, chatJID)
 				patch.Mutations = append(patch.Mutations, appstate.BuildLabelChat(chatJID, m.LabelId, m.Labeled).Mutations...)
 			default:
 				s.Respond(w, r, http.StatusBadRequest, errors.New(fmt.Sprintf("unknown mutation type %q at %d", m.Type, i)))
