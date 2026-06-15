@@ -7215,39 +7215,15 @@ func (s *server) ArchiveChat() http.HandlerFunc {
 
 }
 
-// buildActiveLabelEdit monta o mesmo app-state mutation que appstate.BuildLabelEdit,
-// porém com IsActive=true e Type=CUSTOM. O WhatsApp Business só RENDERIZA as
-// associações (etiqueta↔contato) de uma etiqueta isActive:true; o helper do
-// whatsmeow omite esse campo (fica false), então as etiquetas criadas pela API
-// apareciam apenas na LISTA de etiquetas, nunca coladas no contato. Espelha o que
-// o app oficial envia ao criar/editar uma etiqueta de negócio.
+// buildActiveLabelEdit monta o app-state mutation de uma etiqueta de negócio com
+// IsActive=true e Type=CUSTOM. O WhatsApp Business só RENDERIZA as associações
+// (etiqueta↔contato) de uma etiqueta isActive:true com orderIndex>0; o helper
+// appstate.BuildLabelEdit do whatsmeow omite esses campos, então as etiquetas
+// criadas pela API apareciam só na LISTA, nunca coladas no contato. É o caso
+// especial de buildTypedListEdit (lista CUSTOM): seus defaults (IsActive=true,
+// OrderIndex derivado do id) produzem exatamente o mesmo mutation que antes.
 func buildActiveLabelEdit(labelID, labelName string, labelColor int32, deleted bool) appstate.PatchInfo {
-	labelType := waSyncAction.LabelEditAction_CUSTOM
-	lea := &waSyncAction.LabelEditAction{
-		Name:     proto.String(labelName),
-		Color:    proto.Int32(labelColor),
-		Deleted:  proto.Bool(deleted),
-		IsActive: proto.Bool(true),
-		Type:     &labelType,
-	}
-	// O WhatsApp Business posiciona cada etiqueta com um orderIndex (>0). Uma
-	// etiqueta com orderIndex:0 aparece na LISTA mas NAO renderiza a associacao
-	// nos contatos. O helper do whatsmeow nao seta o campo (fica 0), entao
-	// derivamos do id numerico (unico e estavel) para garantir um orderIndex
-	// valido (>0) — espelhando o que o app oficial faz ao criar a etiqueta.
-	if n, err := strconv.Atoi(labelID); err == nil && n > 0 {
-		lea.OrderIndex = proto.Int32(int32(n))
-	}
-	return appstate.PatchInfo{
-		Type: appstate.WAPatchRegular,
-		Mutations: []appstate.MutationInfo{
-			{
-				Index:   []string{appstate.IndexLabelEdit, labelID},
-				Version: 3,
-				Value:   &waSyncAction.SyncActionValue{LabelEditAction: lea},
-			},
-		},
-	}
+	return buildTypedListEdit(labelID, labelName, labelColor, deleted, waSyncAction.LabelEditAction_CUSTOM, nil, nil)
 }
 
 // EditLabel creates, edits or deletes a WhatsApp Business label (app-state patch).
@@ -7940,6 +7916,245 @@ func (s *server) SetChatLabels() http.HandlerFunc {
 			"labelids": t.LabelIds,
 			"added":    toAdd,
 			"removed":  toRemove,
+		}
+		responseJson, err := json.Marshal(response)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, err)
+		} else {
+			s.Respond(w, r, http.StatusOK, string(responseJson))
+		}
+	}
+
+}
+
+// parseListType maps a ListType name (case-insensitive) to the whatsmeow enum.
+// An empty name defaults to CUSTOM — the type of a user-created list — which
+// corrects the historical behaviour where BuildLabelEdit left the type as NONE.
+// The accepted names come from the generated enum map, so ListType values added
+// by future whatsmeow bumps are accepted without editing this function.
+func parseListType(name string) (waSyncAction.LabelEditAction_ListType, error) {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return waSyncAction.LabelEditAction_CUSTOM, nil
+	}
+	if v, ok := waSyncAction.LabelEditAction_ListType_value[strings.ToUpper(trimmed)]; ok {
+		return waSyncAction.LabelEditAction_ListType(v), nil
+	}
+	return 0, fmt.Errorf("unknown list type %q", name)
+}
+
+// buildTypedListEdit mirrors appstate's internal newLabelEditMutation (Index
+// [label_edit, id], Version 3) but also sets the ListType plus the optional
+// orderIndex/isActive fields. whatsmeow's exported BuildLabelEdit cannot set
+// these, so we assemble the MutationInfo directly instead of forking the lib.
+// orderIndex/isActive are only written when non-nil, to avoid clobbering the
+// current state with zero-values (0 / false).
+func buildTypedListEdit(id, name string, color int32, deleted bool, listType waSyncAction.LabelEditAction_ListType, orderIndex *int32, isActive *bool) appstate.PatchInfo {
+	action := &waSyncAction.LabelEditAction{
+		Name:    proto.String(name),
+		Color:   proto.Int32(color),
+		Deleted: proto.Bool(deleted),
+		Type:    listType.Enum(),
+	}
+	// Defaults espelham buildActiveLabelEdit (fix de label): sem IsActive=true e um
+	// OrderIndex>0 (derivado do id numérico) a lista aparece só na LISTA do WhatsApp
+	// e nunca cola no contato. Override quando o caller informa os campos.
+	if isActive != nil {
+		action.IsActive = isActive
+	} else {
+		action.IsActive = proto.Bool(true)
+	}
+	if orderIndex != nil {
+		action.OrderIndex = orderIndex
+	} else if n, err := strconv.Atoi(id); err == nil && n > 0 {
+		action.OrderIndex = proto.Int32(int32(n))
+	}
+	return appstate.PatchInfo{
+		Type: appstate.WAPatchRegular,
+		Mutations: []appstate.MutationInfo{{
+			Index:   []string{appstate.IndexLabelEdit, id},
+			Version: 3,
+			Value:   &waSyncAction.SyncActionValue{LabelEditAction: action},
+		}},
+	}
+}
+
+// EditList creates/edits/deletes a typed WhatsApp list (app-state patch). Unlike
+// /chat/label/edit it sets the ListType (default CUSTOM) plus the optional
+// orderIndex/isActive, so lists created through the API match how the new
+// WhatsApp "Lists" UI represents them instead of landing as type NONE.
+func (s *server) EditList() http.HandlerFunc {
+
+	type requestEditListStruct struct {
+		Id         string `json:"id"`         // list ID (string). Pick an unused one to create a new list.
+		Name       string `json:"name"`       // list display name
+		Color      int32  `json:"color"`      // color index in the WhatsApp palette
+		Deleted    bool   `json:"deleted"`    // true to delete the list
+		Type       string `json:"type"`       // ListType name (empty = CUSTOM)
+		OrderIndex *int32 `json:"orderIndex"` // optional: position in the list bar
+		IsActive   *bool  `json:"isActive"`   // optional: filter active state
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		txtid := r.Context().Value("userinfo").(Values).Get("Id")
+
+		client := clientManager.GetWhatsmeowClient(txtid)
+
+		if client == nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("no session"))
+			return
+		}
+
+		decoder := json.NewDecoder(r.Body)
+		var t requestEditListStruct
+		err := decoder.Decode(&t)
+		if err != nil {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("could not decode Payload"))
+			return
+		}
+
+		if t.Id == "" {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("missing id in Payload"))
+			return
+		}
+
+		listType, err := parseListType(t.Type)
+		if err != nil {
+			s.Respond(w, r, http.StatusBadRequest, err)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		patch := buildTypedListEdit(t.Id, t.Name, t.Color, t.Deleted, listType, t.OrderIndex, t.IsActive)
+		err = client.SendAppState(ctx, patch)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("failed to edit list: %s", err)))
+			return
+		}
+		statusText := "List created/edited"
+		if t.Deleted {
+			statusText = "List deleted"
+		}
+		response := map[string]interface{}{
+			"success": true,
+			"message": statusText,
+			"id":      t.Id,
+			"type":    listType.String(),
+		}
+		responseJson, err := json.Marshal(response)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, err)
+		} else {
+			s.Respond(w, r, http.StatusOK, string(responseJson))
+		}
+	}
+
+}
+
+// ApplyList batches typed-list edits and chat associations into a single
+// WAPatchRegular patch (one SendAppState), mirroring ApplyLabels so a sequential
+// app-state version conflict can't discard the 2nd mutation. The "edit" mutation
+// supports the ListType (default CUSTOM) plus optional orderIndex/isActive; the
+// "chat" mutation reuses BuildLabelChat (associations are type-agnostic).
+func (s *server) ApplyList() http.HandlerFunc {
+
+	type listMutation struct {
+		Type string `json:"type"` // "edit" | "chat"
+		// edit fields:
+		Id         string `json:"id"`
+		Name       string `json:"name"`
+		Color      int32  `json:"color"`
+		Deleted    bool   `json:"deleted"`
+		ListType   string `json:"listType"` // ListType name (empty = CUSTOM)
+		OrderIndex *int32 `json:"orderIndex"`
+		IsActive   *bool  `json:"isActive"`
+		// chat fields:
+		Jid     string `json:"jid"`
+		LabelId string `json:"labelId"`
+		Labeled bool   `json:"labeled"`
+	}
+
+	type requestApplyListStruct struct {
+		Mutations []listMutation `json:"mutations"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		txtid := r.Context().Value("userinfo").(Values).Get("Id")
+
+		client := clientManager.GetWhatsmeowClient(txtid)
+
+		if client == nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("no session"))
+			return
+		}
+
+		decoder := json.NewDecoder(r.Body)
+		var t requestApplyListStruct
+		err := decoder.Decode(&t)
+		if err != nil {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("could not decode Payload"))
+			return
+		}
+
+		if len(t.Mutations) == 0 {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("missing mutations in Payload"))
+			return
+		}
+
+		patch := appstate.PatchInfo{Type: appstate.WAPatchRegular}
+		for i, m := range t.Mutations {
+			switch m.Type {
+			case "edit":
+				if m.Id == "" {
+					s.Respond(w, r, http.StatusBadRequest, errors.New(fmt.Sprintf("missing id in mutation %d", i)))
+					return
+				}
+				listType, err := parseListType(m.ListType)
+				if err != nil {
+					s.Respond(w, r, http.StatusBadRequest, errors.New(fmt.Sprintf("mutation %d: %s", i, err)))
+					return
+				}
+				patch.Mutations = append(patch.Mutations, buildTypedListEdit(m.Id, m.Name, m.Color, m.Deleted, listType, m.OrderIndex, m.IsActive).Mutations...)
+			case "chat":
+				if m.Jid == "" {
+					s.Respond(w, r, http.StatusBadRequest, errors.New(fmt.Sprintf("missing jid in mutation %d", i)))
+					return
+				}
+				if m.LabelId == "" {
+					s.Respond(w, r, http.StatusBadRequest, errors.New(fmt.Sprintf("missing labelId in mutation %d", i)))
+					return
+				}
+				chatJID, err := types.ParseJID(m.Jid)
+				if err != nil {
+					s.Respond(w, r, http.StatusBadRequest, errors.New(fmt.Sprintf("invalid Chat JID in mutation %d", i)))
+					return
+				}
+				// Etiquetar usa o LID do contato (não o phone JID): mesma resolução
+				// que LabelChat/ApplyLabels após o fix do fork, senão a associação
+				// é gravada mas não aparece no contato.
+				chatJID = resolveLabelTargetJID(client, chatJID)
+				patch.Mutations = append(patch.Mutations, appstate.BuildLabelChat(chatJID, m.LabelId, m.Labeled).Mutations...)
+			default:
+				s.Respond(w, r, http.StatusBadRequest, errors.New(fmt.Sprintf("unknown mutation type %q at %d", m.Type, i)))
+				return
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		err = client.SendAppState(ctx, patch)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("failed to apply list: %s", err)))
+			return
+		}
+
+		response := map[string]interface{}{
+			"success": true,
+			"message": "Lists applied",
+			"count":   len(patch.Mutations),
 		}
 		responseJson, err := json.Marshal(response)
 		if err != nil {

@@ -128,6 +128,12 @@ func (s *server) routes() {
 	s.router.Handle("/chat/label/resync", c.Then(s.ResyncLabels())).Methods("POST")
 	s.router.Handle("/chat/labels", c.Then(s.SetChatLabels())).Methods("POST")
 
+	// Typed lists (WhatsApp "Lists" / ListType). Writes set the list type; reads
+	// reuse ListLabels (which already returns labelType) via the /chat/list/list alias.
+	s.router.Handle("/chat/list/edit", c.Then(s.EditList())).Methods("POST")
+	s.router.Handle("/chat/list/apply", c.Then(s.ApplyList())).Methods("POST")
+	s.router.Handle("/chat/list/list", c.Then(s.ListLabels())).Methods("GET", "POST")
+
 	s.router.Handle("/status/set/text", c.Then(s.SetStatusMessage())).Methods("POST")
 
 	s.router.Handle("/call/reject", c.Then(s.RejectCall())).Methods("POST")
