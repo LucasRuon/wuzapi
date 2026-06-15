@@ -7632,6 +7632,20 @@ func (snapshot *whatsAppLabelSnapshot) buildResponse(includeDeleted, includeUnla
 	}
 }
 
+// chatLabelIDs retorna os IDs de label atualmente associados (Labeled=true) ao JID
+// informado, ordenados, para comparação de conjunto. É a projeção por chat do mesmo
+// snapshot que alimenta o /chat/label/list.
+func (snapshot *whatsAppLabelSnapshot) chatLabelIDs(jid string) []string {
+	ids := make([]string, 0)
+	for _, association := range snapshot.chatAssociations {
+		if association.JID == jid && association.Labeled {
+			ids = append(ids, association.LabelID)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 func queryBool(r *http.Request, key string) bool {
 	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get(key))) {
 	case "1", "true", "yes", "y", "on":
@@ -7639,6 +7653,57 @@ func queryBool(r *http.Request, key string) bool {
 	default:
 		return false
 	}
+}
+
+// syncLabelSnapshot forces an active fetch of the regular app-state patch (the one
+// that carries WhatsApp Business labels) and captures the re-emitted
+// LabelEdit/LabelAssociationChat events into a snapshot. It suppresses dispatch of
+// those events to the webhook (labelListSyncs) for the duration of the read, so the
+// active read never floods the CRM mirror. The socket must be connected. Both
+// /chat/label/list and /chat/labels share this single source of truth for "read the
+// real labels from WhatsApp".
+func (s *server) syncLabelSnapshot(client *whatsmeow.Client, txtid string) (*whatsAppLabelSnapshot, error) {
+	originalEmitAppStateEventsOnFullSync := client.EmitAppStateEventsOnFullSync
+	client.EmitAppStateEventsOnFullSync = true
+	defer func() {
+		client.EmitAppStateEventsOnFullSync = originalEmitAppStateEventsOnFullSync
+	}()
+
+	snapshot := newWhatsAppLabelSnapshot()
+	var snapshotMu sync.Mutex
+	handlerID := client.AddEventHandler(func(rawEvt interface{}) {
+		switch rawEvt.(type) {
+		case *events.LabelEdit, *events.LabelAssociationChat:
+			snapshotMu.Lock()
+			snapshot.applyEvent(rawEvt)
+			snapshotMu.Unlock()
+		}
+	})
+	handlerRemoved := false
+	defer func() {
+		if !handlerRemoved {
+			client.RemoveEventHandler(handlerID)
+		}
+	}()
+
+	if mycli := clientManager.GetMyClient(txtid); mycli != nil {
+		mycli.labelListSyncs.Add(1)
+		defer mycli.labelListSyncs.Add(-1)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	err := client.FetchAppState(ctx, appstate.WAPatchRegular, true, false)
+	// Remove the handler before reading: FetchAppState is synchronous, so once it
+	// returns every re-emitted event has already been applied and there are no more
+	// concurrent writers to the snapshot.
+	handlerRemoved = client.RemoveEventHandler(handlerID)
+	if err != nil {
+		return nil, err
+	}
+
+	return snapshot, nil
 }
 
 // ListLabels fetches WhatsApp's current regular app-state snapshot and returns
@@ -7660,47 +7725,13 @@ func (s *server) ListLabels() http.HandlerFunc {
 		includeDeleted := queryBool(r, "includeDeleted")
 		includeUnlabeled := queryBool(r, "includeUnlabeled")
 
-		originalEmitAppStateEventsOnFullSync := client.EmitAppStateEventsOnFullSync
-		client.EmitAppStateEventsOnFullSync = true
-		defer func() {
-			client.EmitAppStateEventsOnFullSync = originalEmitAppStateEventsOnFullSync
-		}()
-
-		snapshot := newWhatsAppLabelSnapshot()
-		var snapshotMu sync.Mutex
-		handlerID := client.AddEventHandler(func(rawEvt interface{}) {
-			switch rawEvt.(type) {
-			case *events.LabelEdit, *events.LabelAssociationChat:
-				snapshotMu.Lock()
-				snapshot.applyEvent(rawEvt)
-				snapshotMu.Unlock()
-			}
-		})
-		handlerRemoved := false
-		defer func() {
-			if !handlerRemoved {
-				client.RemoveEventHandler(handlerID)
-			}
-		}()
-
-		if mycli := clientManager.GetMyClient(txtid); mycli != nil {
-			mycli.labelListSyncs.Add(1)
-			defer mycli.labelListSyncs.Add(-1)
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		err := client.FetchAppState(ctx, appstate.WAPatchRegular, true, false)
-		handlerRemoved = client.RemoveEventHandler(handlerID)
+		snapshot, err := s.syncLabelSnapshot(client, txtid)
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("failed to list labels: %s", err)))
 			return
 		}
 
-		snapshotMu.Lock()
 		response := snapshot.buildResponse(includeDeleted, includeUnlabeled, time.Now())
-		snapshotMu.Unlock()
 
 		responseJson, err := json.Marshal(response)
 		if err != nil {
@@ -7754,6 +7785,161 @@ func (s *server) ResyncLabels() http.HandlerFunc {
 		response := map[string]interface{}{
 			"success": true,
 			"message": "Label resync requested",
+		}
+		responseJson, err := json.Marshal(response)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, err)
+		} else {
+			s.Respond(w, r, http.StatusOK, string(responseJson))
+		}
+	}
+
+}
+
+// diffChatLabels compares a chat's current label set with the desired set and
+// returns which labels to associate (toAdd) and which to remove (toRemove) so the
+// chat ends up with exactly 'desired'. Declarative and idempotent: equal sets yield
+// empty diffs. Empty strings are ignored and duplicates collapsed.
+func diffChatLabels(current, desired []string) (toAdd, toRemove []string) {
+	currentSet := make(map[string]struct{}, len(current))
+	for _, id := range current {
+		if id != "" {
+			currentSet[id] = struct{}{}
+		}
+	}
+	desiredSet := make(map[string]struct{}, len(desired))
+	for _, id := range desired {
+		if id != "" {
+			desiredSet[id] = struct{}{}
+		}
+	}
+
+	toAdd = make([]string, 0)
+	for id := range desiredSet {
+		if _, ok := currentSet[id]; !ok {
+			toAdd = append(toAdd, id)
+		}
+	}
+	toRemove = make([]string, 0)
+	for id := range currentSet {
+		if _, ok := desiredSet[id]; !ok {
+			toRemove = append(toRemove, id)
+		}
+	}
+
+	sort.Strings(toAdd)
+	sort.Strings(toRemove)
+	return toAdd, toRemove
+}
+
+// SetChatLabels declaratively sets the full label set of a chat (drop-in for the
+// uazapi POST /chat/labels contract: number + labelids). It reads the chat's current
+// labels, diffs them against the desired list, and applies the additions/removals in
+// a single app-state patch. Replace semantics: labels not in 'labelids' are removed.
+// Idempotent — re-sending the same set is a no-op. The referenced label IDs must
+// already exist (create/edit them via /chat/label/edit).
+func (s *server) SetChatLabels() http.HandlerFunc {
+
+	type requestSetChatLabelsStruct struct {
+		Number   string   `json:"number"`   // phone number (or JID) of the chat to label
+		LabelIds []string `json:"labelids"` // desired final set of label IDs for the chat
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		txtid := r.Context().Value("userinfo").(Values).Get("Id")
+
+		client := clientManager.GetWhatsmeowClient(txtid)
+		if client == nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("no session"))
+			return
+		}
+		// Reading the current set needs the socket up (FetchAppState); an offline
+		// session has nothing to diff against.
+		if !client.IsConnected() {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("not connected"))
+			return
+		}
+
+		decoder := json.NewDecoder(r.Body)
+		var t requestSetChatLabelsStruct
+		err := decoder.Decode(&t)
+		if err != nil {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("could not decode Payload"))
+			return
+		}
+
+		if t.Number == "" {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("missing number in Payload"))
+			return
+		}
+
+		// Same nono-dígito resolution as the other label routes so the association
+		// sticks on the canonical JID WhatsApp uses for the contact.
+		chatJID, ok := parseJIDNormalized(client, t.Number)
+		if !ok {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("could not parse number"))
+			return
+		}
+
+		// Read the chat's current labels (active app-state read, same machinery and
+		// webhook suppression as /chat/label/list).
+		snapshot, err := s.syncLabelSnapshot(client, txtid)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("failed to read current labels: %s", err)))
+			return
+		}
+
+		current := snapshot.chatLabelIDs(chatJID.String())
+		toAdd, toRemove := diffChatLabels(current, t.LabelIds)
+
+		// Idempotent: nothing to change.
+		if len(toAdd) == 0 && len(toRemove) == 0 {
+			response := map[string]interface{}{
+				"success":  true,
+				"message":  "Labels already in sync",
+				"number":   t.Number,
+				"jid":      chatJID.String(),
+				"labelids": current,
+				"added":    []string{},
+				"removed":  []string{},
+			}
+			responseJson, err := json.Marshal(response)
+			if err != nil {
+				s.Respond(w, r, http.StatusInternalServerError, err)
+			} else {
+				s.Respond(w, r, http.StatusOK, string(responseJson))
+			}
+			return
+		}
+
+		// One WAPatchRegular patch carrying every add/remove, so WhatsApp applies the
+		// whole set transition atomically (avoids the sequential-SendAppState version
+		// conflict that discards mutations).
+		patch := appstate.PatchInfo{Type: appstate.WAPatchRegular}
+		for _, id := range toAdd {
+			patch.Mutations = append(patch.Mutations, appstate.BuildLabelChat(chatJID, id, true).Mutations...)
+		}
+		for _, id := range toRemove {
+			patch.Mutations = append(patch.Mutations, appstate.BuildLabelChat(chatJID, id, false).Mutations...)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		err = client.SendAppState(ctx, patch)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("failed to set labels: %s", err)))
+			return
+		}
+
+		response := map[string]interface{}{
+			"success":  true,
+			"message":  "Labels set",
+			"number":   t.Number,
+			"jid":      chatJID.String(),
+			"labelids": t.LabelIds,
+			"added":    toAdd,
+			"removed":  toRemove,
 		}
 		responseJson, err := json.Marshal(response)
 		if err != nil {

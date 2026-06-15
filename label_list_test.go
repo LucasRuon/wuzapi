@@ -1,6 +1,7 @@
 package main
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -91,5 +92,57 @@ func TestWhatsAppLabelSnapshotBuildResponseFiltersInactiveStateByDefault(t *test
 	}
 	if len(fullResponse.ChatAssociations) != 2 {
 		t.Fatalf("full associations length = %d, want 2: %#v", len(fullResponse.ChatAssociations), fullResponse.ChatAssociations)
+	}
+}
+
+func TestWhatsAppLabelSnapshotChatLabelIDs(t *testing.T) {
+	snapshot := newWhatsAppLabelSnapshot()
+
+	now := time.Date(2026, 6, 12, 16, 50, 0, 0, time.UTC)
+	target := types.NewJID("5511999999999", types.DefaultUserServer)
+	other := types.NewJID("5511888888888", types.DefaultUserServer)
+	labeled := true
+	unlabeled := false
+
+	// target: label "10" active, "20" active, "30" explicitly removed.
+	snapshot.applyEvent(&events.LabelAssociationChat{JID: target, Timestamp: now, LabelID: "20", Action: &waSyncAction.LabelAssociationAction{Labeled: &labeled}})
+	snapshot.applyEvent(&events.LabelAssociationChat{JID: target, Timestamp: now, LabelID: "10", Action: &waSyncAction.LabelAssociationAction{Labeled: &labeled}})
+	snapshot.applyEvent(&events.LabelAssociationChat{JID: target, Timestamp: now, LabelID: "30", Action: &waSyncAction.LabelAssociationAction{Labeled: &unlabeled}})
+	// other chat must not leak into target's set.
+	snapshot.applyEvent(&events.LabelAssociationChat{JID: other, Timestamp: now, LabelID: "99", Action: &waSyncAction.LabelAssociationAction{Labeled: &labeled}})
+
+	got := snapshot.chatLabelIDs(target.String())
+	want := []string{"10", "20"} // sorted, only active, only this JID
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("chatLabelIDs(%s) = %#v, want %#v", target.String(), got, want)
+	}
+
+	if empty := snapshot.chatLabelIDs("000@s.whatsapp.net"); len(empty) != 0 {
+		t.Fatalf("chatLabelIDs(unknown) = %#v, want empty", empty)
+	}
+}
+
+func TestDiffChatLabels(t *testing.T) {
+	cases := []struct {
+		name             string
+		current, desired []string
+		wantAdd, wantRem []string
+	}{
+		{"add and remove", []string{"10", "20"}, []string{"20", "30"}, []string{"30"}, []string{"10"}},
+		{"idempotent no-op", []string{"10", "20"}, []string{"20", "10"}, []string{}, []string{}},
+		{"add all from empty", nil, []string{"10", "20"}, []string{"10", "20"}, []string{}},
+		{"clear all", []string{"10", "20"}, nil, []string{}, []string{"10", "20"}},
+		{"dedup and ignore empty", []string{"10", "10", ""}, []string{"10", "", "20", "20"}, []string{"20"}, []string{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotAdd, gotRem := diffChatLabels(tc.current, tc.desired)
+			if !reflect.DeepEqual(gotAdd, tc.wantAdd) {
+				t.Errorf("toAdd = %#v, want %#v", gotAdd, tc.wantAdd)
+			}
+			if !reflect.DeepEqual(gotRem, tc.wantRem) {
+				t.Errorf("toRemove = %#v, want %#v", gotRem, tc.wantRem)
+			}
+		})
 	}
 }

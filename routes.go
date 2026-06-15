@@ -126,6 +126,7 @@ func (s *server) routes() {
 	s.router.Handle("/chat/label/apply", c.Then(s.ApplyLabels())).Methods("POST")
 	s.router.Handle("/chat/label/list", c.Then(s.ListLabels())).Methods("GET", "POST")
 	s.router.Handle("/chat/label/resync", c.Then(s.ResyncLabels())).Methods("POST")
+	s.router.Handle("/chat/labels", c.Then(s.SetChatLabels())).Methods("POST")
 
 	s.router.Handle("/status/set/text", c.Then(s.SetStatusMessage())).Methods("POST")
 
