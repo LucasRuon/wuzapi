@@ -7223,21 +7223,28 @@ func (s *server) ArchiveChat() http.HandlerFunc {
 // o app oficial envia ao criar/editar uma etiqueta de negócio.
 func buildActiveLabelEdit(labelID, labelName string, labelColor int32, deleted bool) appstate.PatchInfo {
 	labelType := waSyncAction.LabelEditAction_CUSTOM
+	lea := &waSyncAction.LabelEditAction{
+		Name:     proto.String(labelName),
+		Color:    proto.Int32(labelColor),
+		Deleted:  proto.Bool(deleted),
+		IsActive: proto.Bool(true),
+		Type:     &labelType,
+	}
+	// O WhatsApp Business posiciona cada etiqueta com um orderIndex (>0). Uma
+	// etiqueta com orderIndex:0 aparece na LISTA mas NAO renderiza a associacao
+	// nos contatos. O helper do whatsmeow nao seta o campo (fica 0), entao
+	// derivamos do id numerico (unico e estavel) para garantir um orderIndex
+	// valido (>0) — espelhando o que o app oficial faz ao criar a etiqueta.
+	if n, err := strconv.Atoi(labelID); err == nil && n > 0 {
+		lea.OrderIndex = proto.Int32(int32(n))
+	}
 	return appstate.PatchInfo{
 		Type: appstate.WAPatchRegular,
 		Mutations: []appstate.MutationInfo{
 			{
 				Index:   []string{appstate.IndexLabelEdit, labelID},
 				Version: 3,
-				Value: &waSyncAction.SyncActionValue{
-					LabelEditAction: &waSyncAction.LabelEditAction{
-						Name:     proto.String(labelName),
-						Color:    proto.Int32(labelColor),
-						Deleted:  proto.Bool(deleted),
-						IsActive: proto.Bool(true),
-						Type:     &labelType,
-					},
-				},
+				Value:   &waSyncAction.SyncActionValue{LabelEditAction: lea},
 			},
 		},
 	}
