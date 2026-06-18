@@ -167,7 +167,7 @@ func getUserWebhookUrl(token string) string {
 }
 
 func sendEventWithWebHook(mycli *MyClient, postmap map[string]interface{}, path string) {
-	webhookurl := getUserWebhookUrl(mycli.token)
+	rawWebhook := getUserWebhookUrl(mycli.token)
 
 	// Get updated events from cache/database
 	subscribedEvents, err := updateAndGetUserSubscriptions(mycli)
@@ -207,7 +207,7 @@ func sendEventWithWebHook(mycli *MyClient, postmap map[string]interface{}, path 
 		return
 	}
 
-	// Get HMAC key for this user
+	// Instance-level HMAC key (the legacy fallback used by single-URL webhooks).
 	var encryptedHmacKey []byte
 	if userinfo, found := userinfocache.Get(mycli.token); found {
 		encryptedB64 := userinfo.(Values).Get("HmacKeyEncrypted")
@@ -220,7 +220,16 @@ func sendEventWithWebHook(mycli *MyClient, postmap map[string]interface{}, path 
 		}
 	}
 
-	sendToUserWebHookWithHmac(webhookurl, path, jsonData, mycli.userID, mycli.token, encryptedHmacKey)
+	// Fan-out (R2/R3): parse the column (single source of truth — R1) and POST to
+	// every active webhook subscribed to this event, each with its own HMAC key.
+	// subscribedEvents is the validated instance events (the union), used as the
+	// fallback for legacy / inheriting webhooks. The global webhook still fires
+	// once, separately, below.
+	fallbackEvents := strings.Join(subscribedEvents, ",")
+	targets := webhooksForEvent(parseWebhooks(rawWebhook, fallbackEvents, encryptedHmacKey), eventType, mycli.userID)
+	for _, t := range targets {
+		sendToUserWebHookWithHmac(t.URL, path, jsonData, mycli.userID, mycli.token, t.EncryptedHmacKey)
+	}
 
 	// Get global webhook if configured
 	safeGo("sendToGlobalWebHook", func() { sendToGlobalWebHook(jsonData, mycli.token, mycli.userID) })

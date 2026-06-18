@@ -387,22 +387,63 @@ func (s *server) Disconnect() http.HandlerFunc {
 	}
 }
 
+// writeWebhookArray persists the new `webhooks` array form (R4): it encodes the
+// inputs (encrypting each HMAC key), writes the column plus the union events,
+// refreshes the cache, and writes the safe response (no plaintext key). Returns
+// true when it handled the request so the caller skips the legacy path.
+// Validation errors map to 400; crypto/DB errors map to 500.
+func (s *server) writeWebhookArray(w http.ResponseWriter, r *http.Request, txtid, token string, inputs []webhookInput) bool {
+	column, union, err := encodeWebhooks(inputs)
+	if err != nil {
+		if errors.Is(err, errTooManyWebhooks) || errors.Is(err, errEmptyWebhookURL) {
+			s.Respond(w, r, http.StatusBadRequest, err)
+		} else {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("could not set webhooks: %v", err)))
+		}
+		return true
+	}
+
+	if _, err := s.db.Exec("UPDATE users SET webhook=$1, events=$2 WHERE id=$3", column, union, txtid); err != nil {
+		s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("could not set webhooks: %v", err)))
+		return true
+	}
+
+	v := updateUserInfo(r.Context().Value("userinfo"), "Webhook", column)
+	v = updateUserInfo(v, "Events", union)
+	userinfocache.Set(token, v, cache.NoExpiration)
+
+	targets := parseWebhooks(column, union, nil)
+	response := map[string]interface{}{
+		"webhook":  firstWebhookURL(targets),
+		"webhooks": summarizeWebhooks(targets),
+		"events":   splitEvents(union),
+	}
+	responseJson, err := json.Marshal(response)
+	if err != nil {
+		s.Respond(w, r, http.StatusInternalServerError, err)
+	} else {
+		s.Respond(w, r, http.StatusOK, string(responseJson))
+	}
+	return true
+}
+
 // Gets WebHook
 func (s *server) GetWebhook() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 
 		webhook := ""
 		events := ""
+		var hmacKey []byte
 		txtid := r.Context().Value("userinfo").(Values).Get("Id")
 
-		rows, err := s.db.Query("SELECT webhook,events FROM users WHERE id=$1 LIMIT 1", txtid)
+		rows, err := s.db.Query("SELECT webhook,events,hmac_key FROM users WHERE id=$1 LIMIT 1", txtid)
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("could not get webhook: %v", err)))
 			return
 		}
 		defer rows.Close()
 		for rows.Next() {
-			err = rows.Scan(&webhook, &events)
+			err = rows.Scan(&webhook, &events, &hmacKey)
 			if err != nil {
 				s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("could not get webhook: %s", fmt.Sprintf("%s", err))))
 				return
@@ -416,7 +457,15 @@ func (s *server) GetWebhook() http.HandlerFunc {
 
 		eventarray := strings.Split(events, ",")
 
-		response := map[string]interface{}{"webhook": webhook, "subscribe": eventarray}
+		// New view (R5): the full webhook list, with hmac_configured only — the
+		// key is never returned in clear. `webhook` keeps the legacy single-URL
+		// view (first target) for old clients.
+		targets := parseWebhooks(webhook, events, hmacKey)
+		response := map[string]interface{}{
+			"webhook":   firstWebhookURL(targets),
+			"subscribe": eventarray,
+			"webhooks":  summarizeWebhooks(targets),
+		}
 		responseJson, err := json.Marshal(response)
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, err)
@@ -427,11 +476,75 @@ func (s *server) GetWebhook() http.HandlerFunc {
 	}
 }
 
-// DeleteWebhook removes the webhook and clears events for a user
+// deleteSingleWebhook removes one webhook from the array by URL (R6 scoped
+// delete, read-modify-write). For a legacy single-URL column it only matches the
+// stored URL. Responds 404 when the URL is not present, 200 with the remaining
+// webhooks otherwise.
+func (s *server) deleteSingleWebhook(w http.ResponseWriter, r *http.Request, txtid, token, targetURL string) {
+	var webhook string
+	err := s.db.QueryRow("SELECT webhook FROM users WHERE id=$1", txtid).Scan(&webhook)
+	if err != nil {
+		s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("could not delete webhook: %v", err)))
+		return
+	}
+
+	stored, isArray := parseStoredWebhooks(webhook)
+
+	var column, union string
+	removed := 0
+	if isArray {
+		column, union, removed, err = removeStoredWebhookByURL(stored, targetURL)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("could not delete webhook: %v", err)))
+			return
+		}
+	} else if strings.TrimSpace(webhook) == targetURL && targetURL != "" {
+		// Legacy single URL matching the target: removing it clears everything.
+		removed = 1
+	}
+
+	if removed == 0 {
+		s.Respond(w, r, http.StatusNotFound, errors.New("webhook url not found"))
+		return
+	}
+
+	if _, err := s.db.Exec("UPDATE users SET webhook=$1, events=$2 WHERE id=$3", column, union, txtid); err != nil {
+		s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("could not delete webhook: %v", err)))
+		return
+	}
+
+	v := updateUserInfo(r.Context().Value("userinfo"), "Webhook", column)
+	v = updateUserInfo(v, "Events", union)
+	userinfocache.Set(token, v, cache.NoExpiration)
+
+	targets := parseWebhooks(column, union, nil)
+	response := map[string]interface{}{
+		"Details":  "Webhook removed successfully",
+		"removed":  removed,
+		"webhook":  firstWebhookURL(targets),
+		"webhooks": summarizeWebhooks(targets),
+	}
+	responseJson, err := json.Marshal(response)
+	if err != nil {
+		s.Respond(w, r, http.StatusInternalServerError, err)
+	} else {
+		s.Respond(w, r, http.StatusOK, string(responseJson))
+	}
+}
+
+// DeleteWebhook removes the webhook and clears events for a user. With a
+// `?url=<u>` query param it removes a single webhook from the array (R6);
+// without it, it clears all webhooks and events.
 func (s *server) DeleteWebhook() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		txtid := r.Context().Value("userinfo").(Values).Get("Id")
 		token := r.Context().Value("userinfo").(Values).Get("Token")
+
+		// Scoped delete (R6): remove a single webhook from the array.
+		if targetURL := strings.TrimSpace(r.URL.Query().Get("url")); targetURL != "" {
+			s.deleteSingleWebhook(w, r, txtid, token, targetURL)
+			return
+		}
 
 		// Update the database to remove the webhook and clear events
 		_, err := s.db.Exec("UPDATE users SET webhook='', events='' WHERE id=$1", txtid)
@@ -458,9 +571,10 @@ func (s *server) DeleteWebhook() http.HandlerFunc {
 // UpdateWebhook updates the webhook URL and events for a user
 func (s *server) UpdateWebhook() http.HandlerFunc {
 	type updateWebhookStruct struct {
-		WebhookURL string   `json:"webhook"`
-		Events     []string `json:"events,omitempty"`
-		Active     bool     `json:"active"`
+		WebhookURL string         `json:"webhook"`
+		Events     []string       `json:"events,omitempty"`
+		Active     bool           `json:"active"`
+		Webhooks   []webhookInput `json:"webhooks,omitempty"`
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		txtid := r.Context().Value("userinfo").(Values).Get("Id")
@@ -471,6 +585,12 @@ func (s *server) UpdateWebhook() http.HandlerFunc {
 		err := decoder.Decode(&t)
 		if err != nil {
 			s.Respond(w, r, http.StatusBadRequest, errors.New("could not decode payload"))
+			return
+		}
+
+		// New array form (R4): when `webhooks` is present it replaces the whole set.
+		if len(t.Webhooks) > 0 {
+			s.writeWebhookArray(w, r, txtid, token, t.Webhooks)
 			return
 		}
 
@@ -530,8 +650,9 @@ func (s *server) UpdateWebhook() http.HandlerFunc {
 // SetWebhook sets the webhook URL and events for a user
 func (s *server) SetWebhook() http.HandlerFunc {
 	type webhookStruct struct {
-		WebhookURL string   `json:"webhookurl"`
-		Events     []string `json:"events,omitempty"`
+		WebhookURL string         `json:"webhookurl"`
+		Events     []string       `json:"events,omitempty"`
+		Webhooks   []webhookInput `json:"webhooks,omitempty"`
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		txtid := r.Context().Value("userinfo").(Values).Get("Id")
@@ -542,6 +663,12 @@ func (s *server) SetWebhook() http.HandlerFunc {
 		err := decoder.Decode(&t)
 		if err != nil {
 			s.Respond(w, r, http.StatusBadRequest, errors.New("could not decode payload"))
+			return
+		}
+
+		// New array form (R4): when `webhooks` is present it replaces the whole set.
+		if len(t.Webhooks) > 0 {
+			s.writeWebhookArray(w, r, txtid, token, t.Webhooks)
 			return
 		}
 
