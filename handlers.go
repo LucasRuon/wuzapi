@@ -4417,12 +4417,13 @@ func (s *server) ListGroups() http.HandlerFunc {
 
 		txtid := r.Context().Value("userinfo").(Values).Get("Id")
 
-		if clientManager.GetWhatsmeowClient(txtid) == nil {
+		client := clientManager.GetWhatsmeowClient(txtid)
+		if client == nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New("no session"))
 			return
 		}
 
-		resp, err := clientManager.GetWhatsmeowClient(txtid).GetJoinedGroups(r.Context())
+		resp, err := client.GetJoinedGroups(r.Context())
 
 		if err != nil {
 			msg := fmt.Sprintf("failed to get group list: %v", err)
@@ -4433,6 +4434,7 @@ func (s *server) ListGroups() http.HandlerFunc {
 
 		gc := new(GroupCollection)
 		for _, info := range resp {
+			fillGroupParticipantPhoneNumbers(r.Context(), client, info)
 			gc.Groups = append(gc.Groups, *info)
 		}
 
@@ -4447,6 +4449,36 @@ func (s *server) ListGroups() http.HandlerFunc {
 	}
 }
 
+func fillGroupParticipantPhoneNumbers(ctx context.Context, client *whatsmeow.Client, groupInfo *types.GroupInfo) {
+	if client == nil || client.Store == nil || client.Store.LIDs == nil || groupInfo == nil {
+		return
+	}
+
+	for i := range groupInfo.Participants {
+		participant := &groupInfo.Participants[i]
+		if !participant.PhoneNumber.IsEmpty() {
+			continue
+		}
+
+		lid := participant.LID
+		if lid.IsEmpty() && participant.JID.Server == types.HiddenUserServer {
+			lid = participant.JID
+		}
+		if lid.IsEmpty() || lid.Server != types.HiddenUserServer {
+			continue
+		}
+
+		pn, err := client.Store.LIDs.GetPNForLID(ctx, lid)
+		if err != nil {
+			log.Debug().Err(err).Str("lid", lid.String()).Msg("could not resolve group participant phone number")
+			continue
+		}
+		if !pn.IsEmpty() {
+			participant.PhoneNumber = pn
+		}
+	}
+}
+
 // Get group info
 func (s *server) GetGroupInfo() http.HandlerFunc {
 
@@ -4458,7 +4490,8 @@ func (s *server) GetGroupInfo() http.HandlerFunc {
 
 		txtid := r.Context().Value("userinfo").(Values).Get("Id")
 
-		if clientManager.GetWhatsmeowClient(txtid) == nil {
+		client := clientManager.GetWhatsmeowClient(txtid)
+		if client == nil {
 			s.Respond(w, r, http.StatusInternalServerError, errors.New("no session"))
 			return
 		}
@@ -4476,7 +4509,7 @@ func (s *server) GetGroupInfo() http.HandlerFunc {
 			return
 		}
 
-		resp, err := clientManager.GetWhatsmeowClient(txtid).GetGroupInfo(context.Background(), group)
+		resp, err := client.GetGroupInfo(context.Background(), group)
 
 		if err != nil {
 			msg := fmt.Sprintf("Failed to get group info: %v", err)
@@ -4484,6 +4517,8 @@ func (s *server) GetGroupInfo() http.HandlerFunc {
 			s.Respond(w, r, http.StatusInternalServerError, msg)
 			return
 		}
+
+		fillGroupParticipantPhoneNumbers(r.Context(), client, resp)
 
 		responseJson, err := json.Marshal(resp)
 
