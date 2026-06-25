@@ -4410,7 +4410,7 @@ func (s *server) MarkRead() http.HandlerFunc {
 func (s *server) ListGroups() http.HandlerFunc {
 
 	type GroupCollection struct {
-		Groups []types.GroupInfo
+		Groups []GroupInfoWithNames
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -4433,9 +4433,9 @@ func (s *server) ListGroups() http.HandlerFunc {
 		}
 
 		gc := new(GroupCollection)
+		nameCache := make(map[types.JID]string)
 		for _, info := range resp {
-			fillGroupParticipantPhoneNumbers(r.Context(), client, info)
-			gc.Groups = append(gc.Groups, *info)
+			gc.Groups = append(gc.Groups, enrichGroupInfo(r.Context(), client, info, nameCache))
 		}
 
 		responseJson, err := json.Marshal(gc)
@@ -4447,6 +4447,43 @@ func (s *server) ListGroups() http.HandlerFunc {
 
 		return
 	}
+}
+
+// ParticipantWithName extends the whatsmeow participant with the contact name
+// resolved from the local contact store. DisplayName is intentionally left
+// untouched — whatsmeow reserves it for anonymous announcement-group users.
+type ParticipantWithName struct {
+	types.GroupParticipant
+	ContactName string `json:"ContactName,omitempty"`
+}
+
+// GroupInfoWithNames mirrors types.GroupInfo but exposes name-enriched participants.
+type GroupInfoWithNames struct {
+	*types.GroupInfo
+	Participants []ParticipantWithName `json:"Participants"`
+}
+
+// enrichGroupInfo resolves participant phone numbers in place and builds a
+// response that also carries each participant's resolved contact name. nameCache
+// is shared across groups within a single request to avoid redundant lookups in
+// the contact store; pass nil for single-group responses.
+func enrichGroupInfo(ctx context.Context, client *whatsmeow.Client, groupInfo *types.GroupInfo, nameCache map[types.JID]string) GroupInfoWithNames {
+	fillGroupParticipantPhoneNumbers(ctx, client, groupInfo)
+
+	out := GroupInfoWithNames{GroupInfo: groupInfo}
+	if groupInfo == nil {
+		return out
+	}
+
+	out.Participants = make([]ParticipantWithName, len(groupInfo.Participants))
+	for i := range groupInfo.Participants {
+		participant := groupInfo.Participants[i]
+		out.Participants[i] = ParticipantWithName{
+			GroupParticipant: participant,
+			ContactName:      resolveGroupParticipantName(ctx, client, &participant, nameCache),
+		}
+	}
+	return out
 }
 
 func fillGroupParticipantPhoneNumbers(ctx context.Context, client *whatsmeow.Client, groupInfo *types.GroupInfo) {
@@ -4477,6 +4514,54 @@ func fillGroupParticipantPhoneNumbers(ctx context.Context, client *whatsmeow.Cli
 			participant.PhoneNumber = pn
 		}
 	}
+}
+
+// resolveGroupParticipantName looks up the contact name for a participant,
+// trying each known JID (primary, LID, resolved phone number) and returning the
+// first non-empty name with priority FullName > PushName > BusinessName > FirstName.
+// Results are memoized per JID in nameCache when provided.
+func resolveGroupParticipantName(ctx context.Context, client *whatsmeow.Client, participant *types.GroupParticipant, nameCache map[types.JID]string) string {
+	if client == nil || client.Store == nil || client.Store.Contacts == nil {
+		return ""
+	}
+
+	seen := make(map[types.JID]bool)
+	for _, jid := range []types.JID{participant.JID, participant.LID, participant.PhoneNumber} {
+		if jid.IsEmpty() || seen[jid] {
+			continue
+		}
+		seen[jid] = true
+
+		if nameCache != nil {
+			if name, ok := nameCache[jid]; ok {
+				if name != "" {
+					return name
+				}
+				continue
+			}
+		}
+
+		name := ""
+		contact, err := client.Store.Contacts.GetContact(ctx, jid)
+		if err != nil {
+			log.Debug().Err(err).Str("jid", jid.String()).Msg("could not resolve group participant display name")
+		} else if contact.Found {
+			for _, candidate := range []string{contact.FullName, contact.PushName, contact.BusinessName, contact.FirstName} {
+				if candidate != "" {
+					name = candidate
+					break
+				}
+			}
+		}
+
+		if nameCache != nil {
+			nameCache[jid] = name
+		}
+		if name != "" {
+			return name
+		}
+	}
+	return ""
 }
 
 // Get group info
@@ -4518,9 +4603,9 @@ func (s *server) GetGroupInfo() http.HandlerFunc {
 			return
 		}
 
-		fillGroupParticipantPhoneNumbers(r.Context(), client, resp)
+		enriched := enrichGroupInfo(r.Context(), client, resp, nil)
 
-		responseJson, err := json.Marshal(resp)
+		responseJson, err := json.Marshal(enriched)
 
 		if err != nil {
 			s.Respond(w, r, http.StatusInternalServerError, err)
