@@ -147,6 +147,7 @@ func (s *server) routes() {
 	s.router.Handle("/user/unblock", c.Then(s.UnblockUser())).Methods("POST")
 	s.router.Handle("/user/blocklist", c.Then(s.GetBlocklist())).Methods("GET")
 	s.router.Handle("/user/lid/{jid}", c.Then(s.GetUserLID())).Methods("GET")
+	s.router.Handle("/user/pn/{lid}", c.Then(s.GetUserPN())).Methods("GET")
 	s.router.Handle("/user/privacy", c.Then(s.GetPrivacySettings())).Methods("GET")
 	s.router.Handle("/user/privacy", c.Then(s.SetPrivacySetting())).Methods("POST")
 

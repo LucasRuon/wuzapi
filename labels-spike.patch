@@ -1,0 +1,155 @@
+diff --git a/handlers.go b/handlers.go
+index ee3c5d3..183d876 100644
+--- a/handlers.go
++++ b/handlers.go
+@@ -7209,6 +7209,137 @@ func (s *server) ArchiveChat() http.HandlerFunc {
+ 
+ }
+ 
++// EditLabel creates, edits or deletes a WhatsApp Business label (app-state patch).
++// To create a new label, send an unused id with a name and color.
++func (s *server) EditLabel() http.HandlerFunc {
++
++	type requestEditLabelStruct struct {
++		Id      string `json:"id"`      // label ID (string). Pick an unused one to create a new label.
++		Name    string `json:"name"`    // label display name
++		Color   int32  `json:"color"`   // color index in the WhatsApp Business palette
++		Deleted bool   `json:"deleted"` // true to delete the label
++	}
++
++	return func(w http.ResponseWriter, r *http.Request) {
++		txtid := r.Context().Value("userinfo").(Values).Get("Id")
++
++		client := clientManager.GetWhatsmeowClient(txtid)
++
++		if client == nil {
++			s.Respond(w, r, http.StatusInternalServerError, errors.New("no session"))
++			return
++		}
++
++		decoder := json.NewDecoder(r.Body)
++		var t requestEditLabelStruct
++		err := decoder.Decode(&t)
++		if err != nil {
++			s.Respond(w, r, http.StatusBadRequest, errors.New("could not decode Payload"))
++			return
++		}
++
++		// Validate required fields
++		if t.Id == "" {
++			s.Respond(w, r, http.StatusBadRequest, errors.New("missing id in Payload"))
++			return
++		}
++
++		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++		defer cancel()
++
++		err = client.SendAppState(ctx, appstate.BuildLabelEdit(t.Id, t.Name, t.Color, t.Deleted))
++		if err != nil {
++			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("failed to edit label: %s", err)))
++			return
++		}
++		statusText := "Label created/edited"
++		if t.Deleted {
++			statusText = "Label deleted"
++		}
++		response := map[string]interface{}{
++			"success": true,
++			"message": statusText,
++			"id":      t.Id,
++		}
++		responseJson, err := json.Marshal(response)
++		if err != nil {
++			s.Respond(w, r, http.StatusInternalServerError, err)
++		} else {
++			s.Respond(w, r, http.StatusOK, string(responseJson))
++		}
++	}
++
++}
++
++// LabelChat associates or removes a WhatsApp Business label from a chat (app-state patch).
++func (s *server) LabelChat() http.HandlerFunc {
++
++	type requestLabelChatStruct struct {
++		Jid     string `json:"jid"`     // chat JID (contact) to label
++		LabelId string `json:"labelId"` // label ID to associate
++		Labeled bool   `json:"labeled"` // true to apply, false to remove
++	}
++
++	return func(w http.ResponseWriter, r *http.Request) {
++		txtid := r.Context().Value("userinfo").(Values).Get("Id")
++
++		client := clientManager.GetWhatsmeowClient(txtid)
++
++		if client == nil {
++			s.Respond(w, r, http.StatusInternalServerError, errors.New("no session"))
++			return
++		}
++
++		decoder := json.NewDecoder(r.Body)
++		var t requestLabelChatStruct
++		err := decoder.Decode(&t)
++		if err != nil {
++			s.Respond(w, r, http.StatusBadRequest, errors.New("could not decode Payload"))
++			return
++		}
++
++		// Validate required fields
++		if t.Jid == "" {
++			s.Respond(w, r, http.StatusBadRequest, errors.New("missing jid in Payload"))
++			return
++		}
++		if t.LabelId == "" {
++			s.Respond(w, r, http.StatusBadRequest, errors.New("missing labelId in Payload"))
++			return
++		}
++
++		chatJID, err := types.ParseJID(t.Jid)
++		if err != nil {
++			s.Respond(w, r, http.StatusBadRequest, errors.New("invalid Chat JID format"))
++			return
++		}
++
++		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++		defer cancel()
++
++		err = client.SendAppState(ctx, appstate.BuildLabelChat(chatJID, t.LabelId, t.Labeled))
++		if err != nil {
++			s.Respond(w, r, http.StatusInternalServerError, errors.New(fmt.Sprintf("failed to label chat: %s", err)))
++			return
++		}
++		statusText := "Chat labeled"
++		if !t.Labeled {
++			statusText = "Chat unlabeled"
++		}
++		response := map[string]interface{}{
++			"success": true,
++			"message": statusText,
++		}
++		responseJson, err := json.Marshal(response)
++		if err != nil {
++			s.Respond(w, r, http.StatusInternalServerError, err)
++		} else {
++			s.Respond(w, r, http.StatusOK, string(responseJson))
++		}
++	}
++
++}
++
+ // Downloads Sticker and returns base64 representation
+ func (s *server) DownloadSticker() http.HandlerFunc {
+ 
+diff --git a/routes.go b/routes.go
+index 21b4025..fba1677 100644
+--- a/routes.go
++++ b/routes.go
+@@ -121,6 +121,8 @@ func (s *server) routes() {
+ 	s.router.Handle("/chat/history", c.Then(s.GetHistory())).Methods("GET")
+ 	s.router.Handle("/chat/request-unavailable-message", c.Then(s.RequestUnavailableMessage())).Methods("POST")
+ 	s.router.Handle("/chat/archive", c.Then(s.ArchiveChat())).Methods("POST")
++	s.router.Handle("/chat/label/edit", c.Then(s.EditLabel())).Methods("POST")
++	s.router.Handle("/chat/label/chat", c.Then(s.LabelChat())).Methods("POST")
+ 
+ 	s.router.Handle("/status/set/text", c.Then(s.SetStatusMessage())).Methods("POST")
+ 

@@ -7205,6 +7205,68 @@ func (s *server) GetUserLID() http.HandlerFunc {
 	}
 }
 
+// GetUserPN resolves the phone-number JID for a given LID — the inverse of
+// GetUserLID.
+//
+// Why this exists: HistorySync messages are addressed only by LID. Unlike live
+// Message events, they carry no SenderAlt/RecipientAlt, so a consumer importing
+// history has no phone number for the chat and cannot key it to a contact. The
+// LID→PN mapping already lives in the device store; it just wasn't exposed.
+func (s *server) GetUserPN() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		txtid := r.Context().Value("userinfo").(Values).Get("Id")
+
+		client := clientManager.GetWhatsmeowClient(txtid)
+		if client == nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("no session"))
+			return
+		}
+
+		vars := mux.Vars(r)
+		lidParam := vars["lid"]
+
+		if lidParam == "" {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("missing lid parameter"))
+			return
+		}
+
+		// Safe no-op for @lid (the Brazilian ninth-digit normalization only
+		// applies to phone-number JIDs).
+		lid, ok := parseJIDNormalized(client, lidParam)
+		if !ok {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("invalid lid format"))
+			return
+		}
+
+		// Reject a phone JID up front: it would otherwise fall through to the
+		// store lookup and fail with a confusing "not found" instead of telling
+		// the caller they used the wrong endpoint (/user/lid/{jid} is the inverse).
+		if lid.Server != types.HiddenUserServer {
+			s.Respond(w, r, http.StatusBadRequest, errors.New("jid is not a LID (expected @lid); use /user/lid/{jid} for the inverse lookup"))
+			return
+		}
+
+		pn, err := getCachedPNForLID(r.Context(), client, lid)
+		if err != nil {
+			log.Error().Err(err).Str("lid", lidParam).Msg("Failed to get phone number for LID")
+			s.Respond(w, r, http.StatusNotFound, fmt.Errorf("phone number not found for this LID: %w", err))
+			return
+		}
+
+		response := map[string]interface{}{
+			"lid": lid.String(),
+			"jid": pn.String(),
+		}
+
+		responseJson, err := json.Marshal(response)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, err)
+		} else {
+			s.Respond(w, r, http.StatusOK, string(responseJson))
+		}
+	}
+}
+
 // privacySettingValues maps each settable privacy setting to the values WhatsApp
 // accepts for it, using the matrix documented in whatsmeow's types. Used to reject
 // invalid input before it reaches the server.
