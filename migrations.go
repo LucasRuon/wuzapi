@@ -75,6 +75,40 @@ var migrations = []Migration{
 		Name:  "add_whatsmeow_message_secrets_message_id_idx",
 		UpSQL: addWhatsmeowMessageSecretsMessageIDIndexSQL,
 	},
+	{
+		ID:    10,
+		Name:  "add_anti_ban_state",
+		UpSQL: addAntiBanStateSQL,
+	},
+}
+
+// antiBanUserColumns são as colunas de estado anti-ban por instância adicionadas
+// à tabela users pela migration 10. A lista é a fonte única: o caminho SQLite de
+// applyMigration itera sobre ela, e addAntiBanStateSQL abaixo é o espelho para
+// Postgres.
+var antiBanUserColumns = []struct{ name, def string }{
+	// Circuit breaker de banimento
+	{"ban_state", "TEXT DEFAULT 'ok'"}, // ok | temp | perm | self_paused
+	{"ban_code", "INTEGER DEFAULT 0"},
+	{"ban_reason", "TEXT DEFAULT ''"},
+	{"ban_until", "TIMESTAMP"},
+	// Governor: quota, pacing e warmup
+	{"sent_today", "INTEGER DEFAULT 0"},
+	{"quota_reset_at", "TIMESTAMP"},
+	{"last_send_at", "TIMESTAMP"},
+	{"warmup_started_at", "TIMESTAMP"},
+	{"max_daily_quota", "INTEGER DEFAULT 0"}, // 0 = usa o padrão global
+	{"min_interval_ms", "INTEGER DEFAULT 0"}, // 0 = usa o padrão global
+	// Janela horária de envio
+	{"window_start", "TEXT DEFAULT ''"},  // "09:00"
+	{"window_end", "TEXT DEFAULT ''"},    // "20:00"
+	{"send_timezone", "TEXT DEFAULT ''"}, // "America/Sao_Paulo"
+	// Sinais de risco e comportamento
+	{"consecutive_failures", "INTEGER DEFAULT 0"},
+	{"simulate_typing", "INTEGER DEFAULT 1"},
+	// Fingerprint de dispositivo por instância
+	{"device_os", "TEXT DEFAULT ''"},
+	{"device_platform", "TEXT DEFAULT ''"},
 }
 
 const changeIDToStringSQL = `
@@ -226,6 +260,51 @@ BEGIN
 	CREATE INDEX IF NOT EXISTS whatsmeow_message_secrets_message_id_idx
 	ON whatsmeow_message_secrets (message_id);
 END $$;
+-- SQLite version (handled in code)
+`
+
+// addAntiBanStateSQL cria o estado anti-ban por instância (migration 10).
+//
+// Usa ADD COLUMN IF NOT EXISTS (Postgres 9.6+) em vez do bloco
+// DO $$ IF NOT EXISTS ... END IF $$ das migrations anteriores: são 17 colunas, e
+// a forma curta diz a mesma coisa em um terço das linhas. A garantia de
+// idempotência é idêntica.
+const addAntiBanStateSQL = `
+-- PostgreSQL version
+ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_state            TEXT DEFAULT 'ok';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_code             INTEGER DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason           TEXT DEFAULT '';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_until            TIMESTAMP;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS sent_today           INTEGER DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS quota_reset_at       TIMESTAMP;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_send_at         TIMESTAMP;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS warmup_started_at    TIMESTAMP;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS max_daily_quota      INTEGER DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS min_interval_ms      INTEGER DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS window_start         TEXT DEFAULT '';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS window_end           TEXT DEFAULT '';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS send_timezone        TEXT DEFAULT '';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS consecutive_failures INTEGER DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS simulate_typing      INTEGER DEFAULT 1;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS device_os            TEXT DEFAULT '';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS device_platform      TEXT DEFAULT '';
+
+CREATE TABLE IF NOT EXISTS suppression (
+    user_id    TEXT NOT NULL,
+    jid        TEXT NOT NULL,
+    reason     TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    PRIMARY KEY (user_id, jid)
+);
+
+CREATE TABLE IF NOT EXISTS send_events (
+    id         SERIAL PRIMARY KEY,
+    user_id    TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    body_hash  TEXT DEFAULT '',
+    created_at TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS send_events_user_time_idx ON send_events (user_id, created_at);
 -- SQLite version (handled in code)
 `
 
@@ -453,6 +532,41 @@ func applyMigration(db *sqlx.DB, migration Migration) error {
 	} else if migration.ID == 9 {
 		if db.DriverName() == "sqlite" {
 			err = nil
+		} else {
+			_, err = tx.Exec(migration.UpSQL)
+		}
+	} else if migration.ID == 10 {
+		if db.DriverName() == "sqlite" {
+			for _, col := range antiBanUserColumns {
+				if err = addColumnIfNotExistsSQLite(tx, "users", col.name, col.def); err != nil {
+					break
+				}
+			}
+			if err == nil {
+				err = createTableIfNotExistsSQLite(tx, "suppression", `
+                    CREATE TABLE suppression (
+                        user_id    TEXT NOT NULL,
+                        jid        TEXT NOT NULL,
+                        reason     TEXT NOT NULL,
+                        created_at TIMESTAMP NOT NULL,
+                        PRIMARY KEY (user_id, jid)
+                    )`)
+			}
+			if err == nil {
+				err = createTableIfNotExistsSQLite(tx, "send_events", `
+                    CREATE TABLE send_events (
+                        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id    TEXT NOT NULL,
+                        kind       TEXT NOT NULL,
+                        body_hash  TEXT DEFAULT '',
+                        created_at TIMESTAMP NOT NULL
+                    )`)
+			}
+			if err == nil {
+				_, err = tx.Exec(`
+                    CREATE INDEX IF NOT EXISTS send_events_user_time_idx
+                    ON send_events (user_id, created_at)`)
+			}
 		} else {
 			_, err = tx.Exec(migration.UpSQL)
 		}
