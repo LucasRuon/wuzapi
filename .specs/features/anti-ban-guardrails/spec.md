@@ -78,8 +78,15 @@ disparando. Sem isso, todo o resto é otimização de margem.
    `ban_until=now+evt.Expire` para aquela instância.
 2. WHEN uma instância tem `ban_state='temp'` e `ban_until` no futuro THEN qualquer
    requisição a `/chat/send/*` SHALL responder `423` com corpo
-   `{"error":"instance_banned","code":<int>,"reason":"<string>","until":"<RFC3339>"}`
+   `{"code":423,"success":false,"error":"instance_banned","banCode":<int>,"reason":"<string>","until":"<RFC3339>"}`
    e SHALL NOT chamar `whatsmeow.SendMessage`.
+
+   > **Corrigido em T2 (2026-08-10).** A redação original pedia o código do ban
+   > no campo `code`. O envelope de `s.Respond` (`handlers.go:6199`) já usa `code`
+   > para o status HTTP em **toda** resposta da API, e o broadcast-app lê
+   > `payload.error`/`payload.success` (`src/lib/wuzapi.ts:53-59`). Mudar o
+   > significado de `code` só nestas rotas quebraria clientes existentes, então o
+   > código do ban vai em `banCode`.
 3. WHEN `events.TemporaryBan` é recebido THEN o gateway SHALL despachar um webhook
    de tipo `TemporaryBan` contendo `code`, `reason` e `expire` em segundos
    (hoje o payload não carrega nenhum dos três).

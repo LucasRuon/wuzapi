@@ -63,6 +63,14 @@ var (
 	mode                = flag.String("mode", "http", "Server mode: http or stdio")
 	dataDir             = flag.String("datadir", "", "Data directory for database and session files (defaults to executable directory)")
 
+	// Governor anti-ban. Os valores passam pelos clamps de AD-003 em
+	// NewGovernorDefaults: a cota só pode descer, o intervalo só pode subir.
+	maxDailyQuota = flag.Int("maxdailyquota", 200, "Max messages per instance per day (capped at 200)")
+	minIntervalMs = flag.Int("minintervalms", 45000, "Min milliseconds between sends per instance (floor of 45000)")
+	windowStart   = flag.String("windowstart", "09:00", "Start of the daily send window (HH:MM, instance timezone)")
+	windowEnd     = flag.String("windowend", "20:00", "End of the daily send window (HH:MM, instance timezone)")
+	sendTimezone  = flag.String("sendtimezone", "America/Sao_Paulo", "IANA timezone for the send window")
+
 	globalHMACKeyEncrypted []byte
 
 	webhookRetryEnabled      = flag.Bool("webhookretry", true, "Enable webhook retry mechanism")
@@ -78,7 +86,7 @@ var (
 	lastMessageCache = cache.New(24*time.Hour, 24*time.Hour)
 	// phoneJIDCache mapeia um número BR (somente dígitos) para o JID canônico
 	// resolvido pelo WhatsApp, evitando uma consulta IsOnWhatsApp a cada envio.
-	phoneJIDCache = cache.New(24*time.Hour, 1*time.Hour)
+	phoneJIDCache    = cache.New(24*time.Hour, 1*time.Hour)
 	globalHTTPClient = newSafeHTTPClient()
 )
 
@@ -282,6 +290,8 @@ func main() {
 	if v := os.Getenv("SESSION_PLATFORM_TYPE"); v != "" {
 		*platformType = v
 	}
+
+	applyGovernorEnvOverrides()
 
 	if *versionFlag {
 		fmt.Printf("WuzAPI version %s\n", version)
