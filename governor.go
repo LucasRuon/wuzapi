@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jmoiron/sqlx"
 	"github.com/rs/zerolog/log"
 )
 
@@ -16,8 +17,9 @@ import (
 //
 // O gateway é o único ponto por onde todo consumidor passa, então é aqui que o
 // limite vira garantia em vez de convenção. Este arquivo define os tipos base —
-// contrato de erro, tipo de envio e configuração. A decisão em si (Acquire) vem
-// nas tarefas seguintes.
+// contrato de erro, tipo de envio e configuração — e a reserva de cota, que é a
+// seção crítica do feature. A composição dos gates (Acquire) vem nas tarefas
+// seguintes.
 
 // ---------------------------------------------------------------------------
 // Tipo de envio
@@ -182,6 +184,138 @@ func NewGovernorDefaults() GovernorDefaults {
 		d.Timezone = "America/Sao_Paulo"
 	}
 	return d
+}
+
+// ---------------------------------------------------------------------------
+// SendGovernor
+// ---------------------------------------------------------------------------
+
+// SendGovernor decide se um envio pode sair agora e reserva a cota quando pode.
+type SendGovernor struct {
+	db       *sqlx.DB
+	defaults GovernorDefaults
+	// now é injetável: a janela horária e a virada de cota são decisões sobre o
+	// relógio, e teste que depende do relógio de parede não é teste.
+	now func() time.Time
+}
+
+func NewSendGovernor(db *sqlx.DB, defaults GovernorDefaults) *SendGovernor {
+	return &SendGovernor{db: db, defaults: defaults, now: time.Now}
+}
+
+// reserve consome uma unidade da cota diária de userID, se houver — e devolve
+// nil quando o envio está liberado.
+//
+// O caminho feliz é um único UPDATE condicional. Mutex em Go não serviria: não
+// protege entre réplicas do container, e a corrida que importa é justamente a de
+// duas requisições concorrentes verem o mesmo sent_today.
+//
+// Todo timestamp vai e volta em UTC. O SQLite compara TIMESTAMP como texto e o
+// driver serializa time.Time preservando o offset, então misturar fusos faria
+// "2026-08-11T00:00-03:00" comparar menor que "2026-08-11T02:00Z" — a mesma
+// virada de dia acontecendo três horas cedo.
+func (g *SendGovernor) reserve(userID string, quota int, minInterval time.Duration, loc *time.Location) *GateError {
+	now := g.now().UTC()
+	pacingDeadline := now.Add(-minInterval)
+	nextReset := nextMidnight(g.now().In(loc)).UTC()
+
+	// quota_reset_at IS NULL é a instância que nunca enviou: conta como janela
+	// vencida, senão a virada nunca seria agendada e a cota nunca zeraria.
+	query := g.db.Rebind(`
+        UPDATE users SET
+            sent_today     = CASE WHEN quota_reset_at IS NULL OR quota_reset_at <= ? THEN 1 ELSE sent_today + 1 END,
+            quota_reset_at = CASE WHEN quota_reset_at IS NULL OR quota_reset_at <= ? THEN ? ELSE quota_reset_at END,
+            last_send_at   = ?
+          WHERE id = ?
+            AND (quota_reset_at IS NULL OR quota_reset_at <= ? OR sent_today < ?)
+            AND (last_send_at IS NULL OR last_send_at <= ?)`)
+
+	res, err := g.db.Exec(query, now, now, nextReset, now, userID, now, quota, pacingDeadline)
+	if err != nil {
+		return governorUnavailable(userID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return governorUnavailable(userID, err)
+	}
+	if affected > 0 {
+		return nil
+	}
+	// Cota ou pacing barrou. Só agora vale um SELECT para descobrir qual — o
+	// caminho feliz não paga por essa consulta.
+	return g.diagnoseReserve(userID, quota, minInterval, now)
+}
+
+// diagnoseReserve descobre por que o UPDATE não afetou nenhuma linha e monta a
+// recusa com o Retry-After que o cliente precisa. Nunca devolve nil: o UPDATE já
+// barrou o envio, e devolver nil aqui o liberaria.
+func (g *SendGovernor) diagnoseReserve(userID string, quota int, minInterval time.Duration, now time.Time) *GateError {
+	var row struct {
+		SentToday    int        `db:"sent_today"`
+		QuotaResetAt *time.Time `db:"quota_reset_at"`
+		LastSendAt   *time.Time `db:"last_send_at"`
+	}
+	query := g.db.Rebind(`SELECT sent_today, quota_reset_at, last_send_at FROM users WHERE id = ?`)
+	if err := g.db.Get(&row, query, userID); err != nil {
+		// Inclui a instância inexistente: estado que não dá para avaliar é
+		// recusa, não liberação (AD-002).
+		return governorUnavailable(userID, err)
+	}
+
+	// Cota antes de pacing: quando os dois barram, esperar 45 s não resolve um
+	// limite que só vira à meia-noite — e o cliente reagendaria errado.
+	if row.QuotaResetAt != nil && row.QuotaResetAt.After(now) && row.SentToday >= quota {
+		return &GateError{
+			Status:     http.StatusTooManyRequests,
+			Code:       CodeQuotaExceeded,
+			Reason:     "cota diária de envios esgotada",
+			RetryAfter: clampRetryAfter(row.QuotaResetAt.Sub(now)),
+		}
+	}
+	if row.LastSendAt != nil {
+		if remaining := minInterval - now.Sub(row.LastSendAt.UTC()); remaining > 0 {
+			return &GateError{
+				Status:     http.StatusTooManyRequests,
+				Code:       CodePacingViolated,
+				Reason:     "aguarde o intervalo mínimo entre envios",
+				RetryAfter: clampRetryAfter(remaining),
+			}
+		}
+	}
+	// O estado mudou entre o UPDATE e o SELECT: outra requisição concorrente
+	// consumiu a vaga. A recusa continua valendo — o cliente repete em 1 s.
+	return &GateError{
+		Status:     http.StatusTooManyRequests,
+		Code:       CodePacingViolated,
+		Reason:     "envio concorrente em andamento",
+		RetryAfter: time.Second,
+	}
+}
+
+// nextMidnight é a próxima meia-noite no fuso de local.
+func nextMidnight(local time.Time) time.Time {
+	y, m, d := local.Date()
+	return time.Date(y, m, d+1, 0, 0, 0, 0, local.Location())
+}
+
+// clampRetryAfter garante um Retry-After utilizável. Zero convidaria o cliente a
+// repetir imediatamente e tomar outra recusa, em loop.
+func clampRetryAfter(d time.Duration) time.Duration {
+	if d < time.Second {
+		return time.Second
+	}
+	return d
+}
+
+// governorUnavailable é a recusa de AD-002: quando a verificação que protege não
+// consegue rodar, a resposta é não enviar.
+func governorUnavailable(userID string, err error) *GateError {
+	log.Error().Err(err).Str("userid", userID).Msg("governor: não foi possível avaliar os limites de envio")
+	return &GateError{
+		Status: http.StatusServiceUnavailable,
+		Code:   CodeGovernorUnavailable,
+		Reason: "não foi possível verificar os limites de envio",
+	}
 }
 
 // applyGovernorEnvOverrides sobrescreve as flags do governor pelo ambiente,
