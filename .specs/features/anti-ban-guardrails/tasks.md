@@ -12,7 +12,7 @@ sub-agent delegation, adequacy review, Verifier, discrimination sensor).
 ---
 
 **Design**: `.specs/features/anti-ban-guardrails/design.md`
-**Status**: Draft
+**Status**: In Progress — Fase 1 concluída (T0, T1, T2)
 **Escopo deste arquivo**: apenas os 18 requisitos P1 (BAN-01 … BAN-18). P2/P3
 (auto-pausa, digitação, spintax, fingerprint, health, retomada no app) entram em
 `tasks-onda2.md` depois que a Onda 1 estiver verificada.
@@ -104,7 +104,9 @@ T3..T9 → T10 → T11 → T12 → T13 → T14
 
 ## Task Breakdown
 
-### T0: Habilitar `go test` no CI
+### T0: ✅ Habilitar `go test` no CI
+
+> **Concluída** — commit `92ffac7`.
 
 **What**: adicionar um step `go test ./... -race` ao workflow de build, entre
 `go vet` e `go build`.
@@ -134,7 +136,9 @@ T3..T9 → T10 → T11 → T12 → T13 → T14
 
 ---
 
-### T1: Migration 10 — estado anti-ban
+### T1: ✅ Migration 10 — estado anti-ban
+
+> **Concluída** — commit `8db8fac`.
 
 **What**: adicionar a migration `add_anti_ban_state` com as 17 colunas em `users`
 e as tabelas `suppression` e `send_events`.
@@ -164,7 +168,9 @@ e as tabelas `suppression` e `send_events`.
 
 ---
 
-### T2: Tipos base do governor — `GateError` e `GovernorDefaults`
+### T2: ✅ Tipos base do governor — `GateError` e `GovernorDefaults`
+
+> **Concluída** — commit `532f883`.
 
 **What**: criar `governor.go` com `GateError` (status/code/reason/retryAfter/until
 + `WriteTo`), `GovernorDefaults`, `SendKind`, `RampStep`, e as flags/env que

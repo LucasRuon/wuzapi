@@ -59,13 +59,30 @@ regra do broadcast-app; passa a valer no gateway.
 
 ## Handoff
 
-**Última sessão:** 2026-08-09
-**Feature ativa:** `anti-ban-guardrails`
-**Estado:** spec + context + design escritos. `tasks.md` gerado para a Onda 1 (P1).
-Nada implementado ainda.
+**Última sessão:** 2026-08-10
+**Feature ativa:** `anti-ban-guardrails` — branch `feat/anti-ban-guardrails`
+**Fase:** 1 de 4 concluída.
 
-**Próximo passo:** executar T0 (habilitar `go test` no CI) e seguir as fases de
-`.specs/features/anti-ban-guardrails/tasks.md`.
+**Concluído:**
+- T0 `92ffac7` — CI passa a rodar `go test ./... -race`
+- T1 `8db8fac` — migration 10 (17 colunas em `users`, tabelas `suppression` e `send_events`)
+- T2 `532f883` — `governor.go`: `GateError`, `SendKind`, `GovernorDefaults` + flags/env
+
+**Próximo passo:** Fase 2, T3 — reserva atômica de cota e pacing em `governor.go`
+(`UPDATE ... WHERE` condicional + `RowsAffected`, com teste de 50 goroutines
+concorrentes provando que só `quota` passam).
+
+**Suíte:** 79 testes, `go test ./... -race` verde. Nenhum arquivo não commitado.
+
+**Desvios registrados:**
+- `GateError.WriteTo` usa `banCode` em vez de `code` para o código do ban — o
+  envelope de `s.Respond` (`handlers.go:6199`) já ocupa `code` com o status HTTP.
+  Marcado com `SPEC_DEVIATION` em `governor.go:80` e corrigido na spec (BAN-02 AC-2).
+
+**Lacunas conhecidas:**
+- O ramo **Postgres** da migration 10 não é exercitado por teste: `makeTestServer`
+  usa SQLite `:memory:` e o repo não tem Postgres em CI. O `ADD COLUMN IF NOT
+  EXISTS` está garantido por revisão, não por gate.
 
 **Contexto que não está no código:**
 - O broadcast-app (`../broadcast-app`) é o consumidor principal e hoje carrega a
