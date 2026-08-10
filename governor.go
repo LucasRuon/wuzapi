@@ -292,6 +292,43 @@ func (g *SendGovernor) diagnoseReserve(userID string, quota int, minInterval tim
 	}
 }
 
+// effectiveQuota é a cota do dia: o menor valor entre o limite configurado e o
+// degrau da rampa de aquecimento correspondente à idade do pareamento.
+//
+// A rampa existe porque número novo disparando volume de número velho é o padrão
+// que o WhatsApp caça. Ela nunca ELEVA a cota — só limita mais, então configurar
+// 200 num pareamento de ontem continua rendendo 30.
+//
+// instanceQuota <= 0 é o sentinela de "não configurado" da coluna max_daily_quota
+// (BAN-11): cai no padrão global, nunca em zero (que travaria a instância).
+func (g *SendGovernor) effectiveQuota(warmupStartedAt *time.Time, instanceQuota int, now time.Time) int {
+	limit := instanceQuota
+	if limit <= 0 {
+		limit = g.defaults.MaxDailyQuota
+	}
+
+	// Sem pareamento registrado — ou com data no futuro, que só acontece com
+	// relógio desalinhado — a instância vale como recém-pareada.
+	days := 0
+	if warmupStartedAt != nil {
+		if elapsed := now.Sub(*warmupStartedAt); elapsed > 0 {
+			days = int(elapsed / (24 * time.Hour))
+		}
+	}
+
+	ramp := 0
+	for _, step := range g.defaults.WarmupRamp {
+		if days >= step.FromDay {
+			ramp = step.Quota
+		}
+	}
+
+	if ramp < limit {
+		return ramp
+	}
+	return limit
+}
+
 // nextMidnight é a próxima meia-noite no fuso de local.
 func nextMidnight(local time.Time) time.Time {
 	y, m, d := local.Date()
