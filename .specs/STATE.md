@@ -61,28 +61,48 @@ regra do broadcast-app; passa a valer no gateway.
 
 **Última sessão:** 2026-08-10
 **Feature ativa:** `anti-ban-guardrails` — branch `feat/anti-ban-guardrails`
-**Fase:** 1 de 4 concluída.
+**Fase:** 2 de 4 concluída.
 
 **Concluído:**
 - T0 `92ffac7` — CI passa a rodar `go test ./... -race`
 - T1 `8db8fac` — migration 10 (17 colunas em `users`, tabelas `suppression` e `send_events`)
 - T2 `532f883` — `governor.go`: `GateError`, `SendKind`, `GovernorDefaults` + flags/env
+- T3 `569e981` — reserva atômica de cota e pacing (`UPDATE` condicional + diagnóstico)
+- T4 `c4d332c` — rampa de warmup por dias desde o pareamento
+- T5 `b2d51db` — janela horária por instância e poda de `send_events`
+- T6 `114bca1` — circuit breaker de ban com expiração preguiçosa + `Acquire` composto
 
-**Próximo passo:** Fase 2, T3 — reserva atômica de cota e pacing em `governor.go`
-(`UPDATE ... WHERE` condicional + `RowsAffected`, com teste de 50 goroutines
-concorrentes provando que só `quota` passam).
+**Próximo passo:** Fase 3 — T7 (`SuppressionStore`), T8 (`matchOptOut`, único `[P]`)
+e T9 (`resolveRecipientJID` com cache negativo). Os dois pontos de encaixe já
+estão marcados por comentário em `Acquire` (`governor.go`, passos 2 e 6).
 
-**Suíte:** 79 testes, `go test ./... -race` verde. Nenhum arquivo não commitado.
+**Suíte:** 132 testes de topo (eram 79 ao fim da Fase 1), 0 skips,
+`go vet && go build && go test ./... -race` verde. Nenhum arquivo não commitado.
 
 **Desvios registrados:**
 - `GateError.WriteTo` usa `banCode` em vez de `code` para o código do ban — o
   envelope de `s.Respond` (`handlers.go:6199`) já ocupa `code` com o status HTTP.
-  Marcado com `SPEC_DEVIATION` em `governor.go:80` e corrigido na spec (BAN-02 AC-2).
+  Marcado com `SPEC_DEVIATION` em `governor.go` e corrigido na spec (BAN-02 AC-2).
+- `Acquire` **não** recebe `context.Context`, ao contrário da assinatura do
+  `design.md`: todo o acesso a dados do repo é sem contexto e não há cancelamento
+  a propagar. Marcado com `SPEC_DEVIATION` em `governor.go`.
+- O `UPDATE` do design não tratava `quota_reset_at IS NULL`. Sem isso a primeira
+  reserva de uma instância nunca agendaria a virada e a cota jamais zeraria — a
+  condição foi adicionada nas três cláusulas.
+- `reserve` recebe `*time.Location` explícito (o design não define a assinatura).
+  Quem resolve o fuso da instância é o `Acquire`.
+- `server` ganhou o campo `governor`, instanciado em `main.go`, porque a poda de
+  `send_events` precisa rodar no boot. T11 reusa a mesma instância.
 
 **Lacunas conhecidas:**
 - O ramo **Postgres** da migration 10 não é exercitado por teste: `makeTestServer`
   usa SQLite `:memory:` e o repo não tem Postgres em CI. O `ADD COLUMN IF NOT
   EXISTS` está garantido por revisão, não por gate.
+- O **tick de 6 h** da poda não tem teste (seria testar `time.Ticker`); só a poda
+  em si e a execução no boot estão cobertas.
+- BAN-10 AC-6 ("`sent_today` não é devolvido quando o whatsmeow falha") não tem
+  teste: não existe caminho de decremento no código. Verificável de fato só em
+  T11, quando a chamada ao whatsmeow entra.
 
 **Contexto que não está no código:**
 - O broadcast-app (`../broadcast-app`) é o consumidor principal e hoje carrega a
@@ -90,3 +110,9 @@ concorrentes provando que só `quota` passam).
   deste feature — o gateway garante o piso, o app propõe o ritmo.
 - Alvo calibrado para listas **opt-in**, 200 msg/dia por instância, multi-tenant.
   Se alguma base deixar de ser opt-in, as quotas precisam cair ~70 %.
+- O driver `modernc.org/sqlite` serializa `time.Time` preservando o offset e o
+  SQLite compara `TIMESTAMP` como texto: **todo timestamp do governor vai e volta
+  em UTC**. Misturar fusos faz a virada de cota acontecer horas antes.
+- `:memory:` puro dá um banco **vazio** a cada conexão nova do pool. Teste de
+  concorrência real usa `file:<nome>?mode=memory&cache=shared`
+  (`makeSharedMemoryDB`, em `governor_reserve_test.go`).

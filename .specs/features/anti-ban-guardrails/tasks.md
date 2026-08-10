@@ -12,7 +12,7 @@ sub-agent delegation, adequacy review, Verifier, discrimination sensor).
 ---
 
 **Design**: `.specs/features/anti-ban-guardrails/design.md`
-**Status**: In Progress — Fase 1 concluída (T0, T1, T2)
+**Status**: In Progress — Fases 1 e 2 concluídas (T0…T6)
 **Escopo deste arquivo**: apenas os 18 requisitos P1 (BAN-01 … BAN-18). P2/P3
 (auto-pausa, digitação, spintax, fingerprint, health, retomada no app) entram em
 `tasks-onda2.md` depois que a Onda 1 estiver verificada.
@@ -201,7 +201,9 @@ alimentam os defaults.
 
 ---
 
-### T3: Reserva atômica de cota e pacing
+### T3: ✅ Reserva atômica de cota e pacing
+
+> **Concluída** — commit `569e981`.
 
 **What**: implementar `SendGovernor.reserve(userID, quota, minInterval)` com o
 `UPDATE ... WHERE` condicional e a discriminação pós-`RowsAffected==0` entre
@@ -233,7 +235,9 @@ alimentam os defaults.
 
 ---
 
-### T4: Rampa de warmup
+### T4: ✅ Rampa de warmup
+
+> **Concluída** — commit `c4d332c`.
 
 **What**: implementar `effectiveQuota(warmupStartedAt, maxDailyQuota, now)`
 aplicando a rampa 30/60/100/150/200 e integrá-la ao `reserve`.
@@ -261,7 +265,9 @@ aplicando a rampa 30/60/100/150/200 e integrá-la ao `reserve`.
 
 ---
 
-### T5: Janela horária e poda de `send_events`
+### T5: ✅ Janela horária e poda de `send_events`
+
+> **Concluída** — commit `b2d51db`.
 
 **What**: implementar `windowGate(now, tz, start, end, skipSunday)` retornando
 aberto/fechado + segundos até a próxima abertura; e a poda periódica de
@@ -290,7 +296,9 @@ aberto/fechado + segundos até a próxima abertura; e a poda periódica de
 
 ---
 
-### T6: Estado de ban — persistência, checagem e expiração
+### T6: ✅ Estado de ban — persistência, checagem e expiração
+
+> **Concluída** — commit `114bca1`.
 
 **What**: implementar `MarkBanned`, `ClearBan`, `banGate` (com limpeza preguiçosa
 quando `ban_until` já passou) e integrá-lo como o **primeiro** gate do `Acquire`.
