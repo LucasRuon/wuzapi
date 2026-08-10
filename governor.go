@@ -11,14 +11,15 @@ import (
 
 	"github.com/jmoiron/sqlx"
 	"github.com/rs/zerolog/log"
+	"go.mau.fi/whatsmeow/types"
 )
 
 // Governor: guardrails anti-ban por instância.
 //
 // O gateway é o único ponto por onde todo consumidor passa, então é aqui que o
-// limite vira garantia em vez de convenção. Este arquivo define os tipos base —
-// contrato de erro, tipo de envio e configuração — e a reserva de cota, que é a
-// seção crítica do feature. A composição dos gates (Acquire) vem nas tarefas
+// limite vira garantia em vez de convenção. Este arquivo define o contrato de
+// erro, a configuração e os gates: ban, janela, cota e ritmo. Supressão do
+// destinatário e pré-flight entram na composição do Acquire nas tarefas
 // seguintes.
 
 // ---------------------------------------------------------------------------
@@ -290,6 +291,182 @@ func (g *SendGovernor) diagnoseReserve(userID string, quota int, minInterval tim
 		Reason:     "envio concorrente em andamento",
 		RetryAfter: time.Second,
 	}
+}
+
+// Estados de ban. 'ok' é o único que libera envio.
+const (
+	banStateOK         = "ok"
+	banStateTemp       = "temp"
+	banStatePerm       = "perm"
+	banStateSelfPaused = "self_paused"
+)
+
+// instanceGovernorState é tudo que o governor precisa saber de uma instância
+// para decidir um envio — lido numa consulta só, no começo do Acquire.
+type instanceGovernorState struct {
+	BanState        string     `db:"ban_state"`
+	BanCode         int        `db:"ban_code"`
+	BanReason       string     `db:"ban_reason"`
+	BanUntil        *time.Time `db:"ban_until"`
+	WarmupStartedAt *time.Time `db:"warmup_started_at"`
+	MaxDailyQuota   int        `db:"max_daily_quota"`
+	MinIntervalMs   int        `db:"min_interval_ms"`
+	WindowStart     string     `db:"window_start"`
+	WindowEnd       string     `db:"window_end"`
+	SendTimezone    string     `db:"send_timezone"`
+}
+
+// Acquire decide se um envio pode sair agora, e reserva a cota quando pode.
+// nil = liberado.
+//
+// A ordem é a do design — a primeira que barrar responde, mais grave e mais
+// barata primeiro:
+//
+//	ban → supressão → janela → quota → pacing → pré-flight
+//
+// SPEC_DEVIATION: o design assina Acquire(ctx, ...). O acesso a banco deste
+// repositório é todo sem context (sqlx.Exec/Get em db.go, wmiau.go), e não há
+// cancelamento a propagar aqui — um ctx só nesta função seria ruído sem efeito.
+// Reason: consistência com o padrão de acesso a dados já estabelecido.
+func (g *SendGovernor) Acquire(userID string, recipient types.JID, kind SendKind) *GateError {
+	now := g.now()
+
+	st, gerr := g.loadState(userID)
+	if gerr != nil {
+		return gerr
+	}
+
+	// 1. Ban: o mais grave e o mais barato. Vale para todo SendKind — instância
+	// travada não fala com o WhatsApp de jeito nenhum.
+	if gerr := g.banGate(userID, st, now); gerr != nil {
+		return gerr
+	}
+
+	// 2. Supressão do destinatário (T7). KindGroup e KindEdit não passam aqui:
+	// grupo não tem opt-out individual, e editar não é contato novo.
+	_ = recipient
+
+	// Editar uma mensagem já enviada não consome cota nem esbarra na janela.
+	if kind == KindEdit {
+		return nil
+	}
+
+	// 3. Janela horária.
+	if gerr := g.windowGate(now, st.SendTimezone, st.WindowStart, st.WindowEnd, g.defaults.SkipSunday); gerr != nil {
+		return gerr
+	}
+
+	// 4 e 5. Cota do dia (limitada pela rampa) e piso de intervalo, na mesma
+	// instrução atômica.
+	quota := g.effectiveQuota(st.WarmupStartedAt, st.MaxDailyQuota, now)
+	if gerr := g.reserve(userID, quota, g.effectiveInterval(st.MinIntervalMs), g.location(st.SendTimezone)); gerr != nil {
+		return gerr
+	}
+
+	// 6. Pré-flight de destinatário (T9) — por último, é o único que faz I/O de
+	// rede, então só é pago quando todos os gates locais passaram.
+	return nil
+}
+
+func (g *SendGovernor) loadState(userID string) (instanceGovernorState, *GateError) {
+	var st instanceGovernorState
+	query := g.db.Rebind(`
+        SELECT ban_state, ban_code, ban_reason, ban_until, warmup_started_at,
+               max_daily_quota, min_interval_ms, window_start, window_end, send_timezone
+          FROM users WHERE id = ?`)
+	if err := g.db.Get(&st, query, userID); err != nil {
+		return st, governorUnavailable(userID, err)
+	}
+	return st, nil
+}
+
+// banGate é o primeiro gate. Um ban vencido é limpo aqui mesmo — limpeza
+// preguiçosa, sem goroutine de varredura: o estado só importa quando alguém
+// tenta enviar.
+func (g *SendGovernor) banGate(userID string, st instanceGovernorState, now time.Time) *GateError {
+	switch st.BanState {
+	case "", banStateOK:
+		return nil
+
+	case banStateTemp, banStateSelfPaused:
+		// Sem prazo registrado o ban não expira sozinho: liberar por falta de
+		// dado é o fail-open que AD-002 proíbe.
+		if st.BanUntil != nil && !st.BanUntil.After(now.UTC()) {
+			if err := g.ClearBan(userID); err != nil {
+				return governorUnavailable(userID, err)
+			}
+			return nil
+		}
+		return banRefusal(st)
+
+	case banStatePerm:
+		// Permanente ignora ban_until: só o clear explícito do admin destrava.
+		return banRefusal(st)
+
+	default:
+		// Estado desconhecido (deploy antigo, escrita manual): recusa.
+		log.Warn().Str("userid", userID).Str("state", st.BanState).
+			Msg("governor: ban_state desconhecido, recusando por segurança")
+		return banRefusal(st)
+	}
+}
+
+func banRefusal(st instanceGovernorState) *GateError {
+	reason := st.BanReason
+	if reason == "" {
+		// O cliente reage diferente a cada caso, então o motivo precisa
+		// distinguir os estados mesmo sem nada gravado no banco.
+		switch st.BanState {
+		case banStateTemp:
+			reason = "instância banida temporariamente"
+		case banStatePerm:
+			reason = "instância banida permanentemente"
+		case banStateSelfPaused:
+			reason = "instância pausada automaticamente"
+		default:
+			reason = "estado de envio indeterminado"
+		}
+	}
+	return &GateError{
+		Status:  http.StatusLocked,
+		Code:    CodeInstanceBanned,
+		Reason:  reason,
+		Until:   st.BanUntil,
+		BanCode: st.BanCode,
+	}
+}
+
+// MarkBanned registra o estado de ban de uma instância. until zerado grava NULL:
+// ban permanente não tem prazo, e um prazo qualquer faria a limpeza preguiçosa
+// liberar sozinha o que só o admin pode liberar.
+func (g *SendGovernor) MarkBanned(userID, state string, code int, reason string, until time.Time) error {
+	var deadline interface{}
+	if !until.IsZero() {
+		deadline = until.UTC()
+	}
+	query := g.db.Rebind(
+		`UPDATE users SET ban_state = ?, ban_code = ?, ban_reason = ?, ban_until = ? WHERE id = ?`)
+	_, err := g.db.Exec(query, state, code, reason, deadline, userID)
+	return err
+}
+
+// ClearBan destrava a instância, zerando também código, motivo e prazo — um
+// ban_code órfão apareceria no health como se ela ainda estivesse marcada.
+func (g *SendGovernor) ClearBan(userID string) error {
+	query := g.db.Rebind(
+		`UPDATE users SET ban_state = ?, ban_code = 0, ban_reason = '', ban_until = NULL WHERE id = ?`)
+	_, err := g.db.Exec(query, banStateOK, userID)
+	return err
+}
+
+// effectiveInterval aplica AD-003 à coluna da instância: a configuração só pode
+// AUMENTAR o intervalo. Um piso que a config relaxa não é piso.
+func (g *SendGovernor) effectiveInterval(instanceMs int) time.Duration {
+	interval := g.defaults.MinInterval
+	if configured := time.Duration(instanceMs) * time.Millisecond; configured > interval {
+		interval = configured
+	}
+	return interval
 }
 
 // windowGate recusa envios fora do horário local da instância — nil quando a
