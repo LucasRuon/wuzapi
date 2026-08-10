@@ -37,10 +37,11 @@ const (
 )
 
 type server struct {
-	db     *sqlx.DB
-	router *mux.Router
-	exPath string
-	mode   ServerMode
+	db       *sqlx.DB
+	router   *mux.Router
+	exPath   string
+	mode     ServerMode
+	governor *SendGovernor
 }
 
 // Replace the global variables
@@ -488,11 +489,15 @@ func main() {
 	}
 
 	s := &server{
-		router: mux.NewRouter(),
-		db:     db,
-		exPath: exPath,
-		mode:   serverMode,
+		router:   mux.NewRouter(),
+		db:       db,
+		exPath:   exPath,
+		mode:     serverMode,
+		governor: NewSendGovernor(db, NewGovernorDefaults()),
 	}
+	// send_events só serve para janelas de 24h: poda o que passou de 7 dias
+	// agora e a cada 6h, senão a tabela cresce para sempre.
+	s.governor.startSendEventPruner()
 	s.routes()
 
 	s.connectOnStartup()

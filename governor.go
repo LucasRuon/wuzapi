@@ -292,6 +292,125 @@ func (g *SendGovernor) diagnoseReserve(userID string, quota int, minInterval tim
 	}
 }
 
+// windowGate recusa envios fora do horário local da instância — nil quando a
+// janela está aberta.
+//
+// Disparo de madrugada é assinatura de robô, e o destinatário que acorda com a
+// mensagem é o que denuncia. tz, start e end vazios caem nos padrões globais
+// (BAN-11); valores inválidos também, com warning: string errada no banco não
+// pode derrubar envio nem processo.
+func (g *SendGovernor) windowGate(now time.Time, tz, start, end string, skipSunday bool) *GateError {
+	loc := g.location(tz)
+	startH, startM := g.clockOrDefault(start, g.defaults.WindowStart, "09:00")
+	endH, endM := g.clockOrDefault(end, g.defaults.WindowEnd, "20:00")
+
+	local := now.In(loc)
+	opensAt := time.Date(local.Year(), local.Month(), local.Day(), startH, startM, 0, 0, loc)
+	closesAt := time.Date(local.Year(), local.Month(), local.Day(), endH, endM, 0, 0, loc)
+
+	sunday := skipSunday && local.Weekday() == time.Sunday
+	if !sunday && !local.Before(opensAt) && !local.After(closesAt) {
+		return nil
+	}
+
+	next := nextWindowOpen(local, startH, startM, skipSunday)
+	return &GateError{
+		Status:     http.StatusTooManyRequests,
+		Code:       CodeWindowClosed,
+		Reason:     "fora da janela de envio da instância",
+		RetryAfter: clampRetryAfter(next.Sub(local)),
+	}
+}
+
+// nextWindowOpen é a próxima abertura a partir de local, pulando domingos.
+//
+// Cada candidato é construído com time.Date no fuso da instância, não somando
+// 24h: numa virada de horário de verão o dia tem 23 ou 25 horas, e a aritmética
+// de duração mandaria o cliente voltar antes da abertura.
+func nextWindowOpen(local time.Time, startH, startM int, skipSunday bool) time.Time {
+	loc := local.Location()
+	for d := 0; d <= 8; d++ {
+		day := local.AddDate(0, 0, d)
+		candidate := time.Date(day.Year(), day.Month(), day.Day(), startH, startM, 0, 0, loc)
+		if skipSunday && candidate.Weekday() == time.Sunday {
+			continue
+		}
+		if !candidate.Before(local) {
+			return candidate
+		}
+	}
+	return local
+}
+
+// location resolve o fuso da instância. Nunca time.Local: esse seria o fuso do
+// container, que não tem relação com o horário de quem recebe a mensagem.
+func (g *SendGovernor) location(tz string) *time.Location {
+	for _, name := range []string{tz, g.defaults.Timezone} {
+		if name == "" {
+			continue
+		}
+		loc, err := time.LoadLocation(name)
+		if err == nil {
+			return loc
+		}
+		log.Warn().Str("timezone", name).Err(err).Msg("governor: fuso inválido, caindo no padrão")
+	}
+	return time.UTC
+}
+
+// clockOrDefault interpreta "HH:MM", caindo no valor da instância, depois no
+// global, depois no embutido. Um horário mal formado NÃO pode virar 00:00 —
+// isso abriria a madrugada inteira, o oposto do que a janela existe para fazer.
+func (g *SendGovernor) clockOrDefault(values ...string) (hour, minute int) {
+	for _, v := range values {
+		if v == "" {
+			continue
+		}
+		h, m, err := parseClock(v)
+		if err == nil {
+			return h, m
+		}
+		log.Warn().Str("clock", v).Msg("governor: horário de janela inválido, caindo no padrão")
+	}
+	return 0, 0
+}
+
+func parseClock(v string) (hour, minute int, err error) {
+	t, err := time.Parse("15:04", v)
+	if err != nil {
+		return 0, 0, err
+	}
+	return t.Hour(), t.Minute(), nil
+}
+
+// sendEventRetention é por quanto tempo send_events serve para alguma coisa: as
+// janelas que a consultam são de 24h. Sem poda a tabela cresce para sempre.
+const sendEventRetention = 7 * 24 * time.Hour
+
+func (g *SendGovernor) pruneSendEvents(now time.Time) error {
+	query := g.db.Rebind(`DELETE FROM send_events WHERE created_at < ?`)
+	_, err := g.db.Exec(query, now.UTC().Add(-sendEventRetention))
+	return err
+}
+
+// startSendEventPruner poda no boot e a cada 6h. A poda do boot é síncrona: um
+// gateway que ficou meses parado não pode voltar carregando a tabela inteira até
+// o primeiro tick.
+func (g *SendGovernor) startSendEventPruner() {
+	if err := g.pruneSendEvents(g.now()); err != nil {
+		log.Error().Err(err).Msg("governor: poda de send_events no boot falhou")
+	}
+	safeGo("send-events-pruner", func() {
+		ticker := time.NewTicker(6 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := g.pruneSendEvents(g.now()); err != nil {
+				log.Error().Err(err).Msg("governor: poda periódica de send_events falhou")
+			}
+		}
+	})
+}
+
 // effectiveQuota é a cota do dia: o menor valor entre o limite configurado e o
 // degrau da rampa de aquecimento correspondente à idade do pareamento.
 //
