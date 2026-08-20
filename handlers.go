@@ -4433,7 +4433,7 @@ func (s *server) ListGroups() http.HandlerFunc {
 		}
 
 		gc := new(GroupCollection)
-		nameCache := make(map[types.JID]string)
+		nameCache := make(map[types.JID]participantNames)
 		for _, info := range resp {
 			gc.Groups = append(gc.Groups, enrichGroupInfo(r.Context(), client, info, nameCache))
 		}
@@ -4450,11 +4450,14 @@ func (s *server) ListGroups() http.HandlerFunc {
 }
 
 // ParticipantWithName extends the whatsmeow participant with the contact name
-// resolved from the local contact store. DisplayName is intentionally left
-// untouched — whatsmeow reserves it for anonymous announcement-group users.
+// resolved from the local contact store.
 type ParticipantWithName struct {
 	types.GroupParticipant
 	ContactName string `json:"ContactName,omitempty"`
+	// RedactedPhone is the partially masked phone number ("+55∙∙∙∙∙∙∙∙80") that
+	// WhatsApp itself shows for LID group members with no known name. Last
+	// resort after ContactName and DisplayName.
+	RedactedPhone string `json:"RedactedPhone,omitempty"`
 }
 
 // GroupInfoWithNames mirrors types.GroupInfo but exposes name-enriched participants.
@@ -4464,10 +4467,10 @@ type GroupInfoWithNames struct {
 }
 
 // enrichGroupInfo resolves participant phone numbers in place and builds a
-// response that also carries each participant's resolved contact name. nameCache
-// is shared across groups within a single request to avoid redundant lookups in
-// the contact store; pass nil for single-group responses.
-func enrichGroupInfo(ctx context.Context, client *whatsmeow.Client, groupInfo *types.GroupInfo, nameCache map[types.JID]string) GroupInfoWithNames {
+// response that also carries each participant's resolved contact name and push
+// name. nameCache is shared across groups within a single request to avoid
+// redundant lookups in the contact store; pass nil for single-group responses.
+func enrichGroupInfo(ctx context.Context, client *whatsmeow.Client, groupInfo *types.GroupInfo, nameCache map[types.JID]participantNames) GroupInfoWithNames {
 	fillGroupParticipantPhoneNumbers(ctx, client, groupInfo)
 
 	out := GroupInfoWithNames{GroupInfo: groupInfo}
@@ -4478,9 +4481,17 @@ func enrichGroupInfo(ctx context.Context, client *whatsmeow.Client, groupInfo *t
 	out.Participants = make([]ParticipantWithName, len(groupInfo.Participants))
 	for i := range groupInfo.Participants {
 		participant := groupInfo.Participants[i]
+		names := resolveGroupParticipantNames(ctx, client, &participant, nameCache)
+		// whatsmeow only fills DisplayName for anonymous announcement-group
+		// users (an obfuscated phone number), so it is never overwritten; when
+		// empty it carries the push name as a fallback for ContactName.
+		if participant.DisplayName == "" {
+			participant.DisplayName = names.push
+		}
 		out.Participants[i] = ParticipantWithName{
 			GroupParticipant: participant,
-			ContactName:      resolveGroupParticipantName(ctx, client, &participant, nameCache),
+			ContactName:      names.contact,
+			RedactedPhone:    names.redacted,
 		}
 	}
 	return out
@@ -4516,13 +4527,26 @@ func fillGroupParticipantPhoneNumbers(ctx context.Context, client *whatsmeow.Cli
 	}
 }
 
-// resolveGroupParticipantName looks up the contact name for a participant,
-// trying each known JID (primary, LID, resolved phone number) and returning the
-// first non-empty name with priority FullName > PushName > BusinessName > FirstName.
-// Results are memoized per JID in nameCache when provided.
-func resolveGroupParticipantName(ctx context.Context, client *whatsmeow.Client, participant *types.GroupParticipant, nameCache map[types.JID]string) string {
+// participantNames holds the names resolved for a single JID in the contact
+// store: contact is the best available name, push is the raw WhatsApp push name.
+type participantNames struct {
+	contact  string
+	push     string
+	redacted string
+}
+
+// resolveGroupParticipantNames looks up the names of a participant, trying each
+// known JID (primary, LID, resolved phone number). contact is the first
+// non-empty name with priority FullName > PushName > BusinessName > FirstName;
+// push is the first non-empty PushName; redacted is the first non-empty
+// RedactedPhone. Each is filled independently, so a participant known only by
+// push name still yields it. Together they form the fallback chain
+// ContactName > DisplayName > RedactedPhone. Results are memoized per JID in
+// nameCache when provided.
+func resolveGroupParticipantNames(ctx context.Context, client *whatsmeow.Client, participant *types.GroupParticipant, nameCache map[types.JID]participantNames) participantNames {
+	var out participantNames
 	if client == nil || client.Store == nil || client.Store.Contacts == nil {
-		return ""
+		return out
 	}
 
 	seen := make(map[types.JID]bool)
@@ -4532,36 +4556,43 @@ func resolveGroupParticipantName(ctx context.Context, client *whatsmeow.Client, 
 		}
 		seen[jid] = true
 
+		names, cached := participantNames{}, false
 		if nameCache != nil {
-			if name, ok := nameCache[jid]; ok {
-				if name != "" {
-					return name
+			names, cached = nameCache[jid]
+		}
+		if !cached {
+			contact, err := client.Store.Contacts.GetContact(ctx, jid)
+			if err != nil {
+				log.Debug().Err(err).Str("jid", jid.String()).Msg("could not resolve group participant name")
+			} else if contact.Found {
+				names.push = contact.PushName
+				names.redacted = contact.RedactedPhone
+				for _, candidate := range []string{contact.FullName, contact.PushName, contact.BusinessName, contact.FirstName} {
+					if candidate != "" {
+						names.contact = candidate
+						break
+					}
 				}
-				continue
+			}
+			if nameCache != nil {
+				nameCache[jid] = names
 			}
 		}
 
-		name := ""
-		contact, err := client.Store.Contacts.GetContact(ctx, jid)
-		if err != nil {
-			log.Debug().Err(err).Str("jid", jid.String()).Msg("could not resolve group participant display name")
-		} else if contact.Found {
-			for _, candidate := range []string{contact.FullName, contact.PushName, contact.BusinessName, contact.FirstName} {
-				if candidate != "" {
-					name = candidate
-					break
-				}
-			}
+		if out.contact == "" {
+			out.contact = names.contact
 		}
-
-		if nameCache != nil {
-			nameCache[jid] = name
+		if out.push == "" {
+			out.push = names.push
 		}
-		if name != "" {
-			return name
+		if out.redacted == "" {
+			out.redacted = names.redacted
+		}
+		if out.contact != "" && out.push != "" && out.redacted != "" {
+			break
 		}
 	}
-	return ""
+	return out
 }
 
 // Get group info
