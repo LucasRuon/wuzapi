@@ -1,0 +1,81 @@
+{
+  "schema": 1,
+  "promote_threshold": 2,
+  "window_days": 45,
+  "quarantine_threshold": 2,
+  "next_id": 5,
+  "lessons": [
+    {
+      "id": "L-001",
+      "key": "surviving_mutant::when a best effort path degrades on error assert the side effects it skips call counts not only the unchanged output values",
+      "text": "When a best-effort path degrades on error, assert the side effects it skips (call counts), not only the unchanged output values.",
+      "signal": "surviving_mutant",
+      "scope": "handlers",
+      "status": "candidate",
+      "features": [
+        "contact-name-resolution"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "M7 handlers.go:4646-4649 (handlers)"
+      ],
+      "created": "2026-08-21T13:11:16Z",
+      "last_seen": "2026-08-21T13:11:16Z"
+    },
+    {
+      "id": "L-002",
+      "key": "surviving_mutant::every defensive guard that protects existing data from being overwritten needs a test where the overwrite would actually happen",
+      "text": "Every defensive guard that protects existing data from being overwritten needs a test where the overwrite would actually happen.",
+      "signal": "surviving_mutant",
+      "scope": "handlers",
+      "status": "candidate",
+      "features": [
+        "contact-name-resolution"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "M10 handlers.go:4669-4671 (handlers)"
+      ],
+      "created": "2026-08-21T13:11:16Z",
+      "last_seen": "2026-08-21T13:11:16Z"
+    },
+    {
+      "id": "L-003",
+      "key": "spec_precision_gap::when two entities share a lookup key spell out in the spec what happens when one of them already has the value being resolved",
+      "text": "When two entities share a lookup key, spell out in the spec what happens when one of them already has the value being resolved.",
+      "signal": "spec_precision_gap",
+      "scope": "spec",
+      "status": "candidate",
+      "features": [
+        "contact-name-resolution"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "spec.md:127 Edge Cases (spec)"
+      ],
+      "created": "2026-08-21T13:11:16Z",
+      "last_seen": "2026-08-21T13:11:16Z"
+    },
+    {
+      "id": "L-004",
+      "key": "ac_gap::refactoring a slice built by append into make t 0 n changes json null to so assert the empty collection response shape before touching a response builder",
+      "text": "Refactoring a slice built by append into make([]T, 0, n) changes JSON null to [], so assert the empty-collection response shape before touching a response builder.",
+      "signal": "ac_gap",
+      "scope": "handlers",
+      "status": "candidate",
+      "features": [
+        "contact-name-resolution"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "P2 AC-2 / handlers.go:4602 (handlers)"
+      ],
+      "created": "2026-08-21T13:11:16Z",
+      "last_seen": "2026-08-21T13:11:16Z"
+    }
+  ]
+}

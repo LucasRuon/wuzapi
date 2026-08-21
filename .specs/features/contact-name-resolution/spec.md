@@ -13,9 +13,9 @@ re-pareamento (a tabela é escopada por `our_jid`) nunca voltam.
 
 ## Goals
 
-- [ ] Um endpoint que force o re-sync completo da agenda do celular pareado,
+- [x] Um endpoint que force o re-sync completo da agenda do celular pareado,
       repovoando `first_name`/`full_name` de todos os contatos salvos.
-- [ ] Um fallback opt-in que resolva nome de conta comercial (verified name) de
+- [x] Um fallback opt-in que resolva nome de conta comercial (verified name) de
       participantes de grupo sem nome nenhum, em uma única consulta em lote.
 
 ## Out of Scope
@@ -142,21 +142,23 @@ participantes sem nome saem com `ContactName` preenchido e os demais intactos.
 
 | Requirement ID | Story | Phase | Status |
 | --- | --- | --- | --- |
-| CNR-01 | P1: resync da agenda (AC 1-2) | Tasks | Pending |
-| CNR-02 | P1: erros e guardas do endpoint (AC 3-6) | Tasks | Pending |
-| CNR-03 | P2: resolve em lote opt-in (AC 1-5) | Tasks | Pending |
-| CNR-04 | P2: teto, falha e ausência de nome (AC 6-8) | Tasks | Pending |
-| CNR-05 | Edge cases (no-op, store nil, phone repetido) | Tasks | Pending |
+| CNR-01 | P1: resync da agenda (AC 1-2) | T1 (`530724b`) | Verified |
+| CNR-02 | P1: erros e guardas do endpoint (AC 3-6) | T1 (`530724b`) | Verified |
+| CNR-03 | P2: resolve em lote opt-in (AC 1-5) | T2 (`6578aec`), T3 (`c2630aa`) | Verified |
+| CNR-04 | P2: teto, falha e ausência de nome (AC 6-8) | T2 (`6578aec`), fix (`d64e3f1`) | Verified |
+| CNR-05 | Edge cases (7 no total) | T2 (`6578aec`), fix (`d64e3f1`) | Verified |
 
-**Coverage:** 5 total, 5 mapeados para tasks, 0 sem mapeamento.
+**Coverage:** 5 total, 5 mapeados para tasks, 0 sem mapeamento. Verificação
+independente (iteração 2): PASS — 16/16 ACs e 7/7 edge cases com evidência,
+sensor de discriminação 18/18 mutantes mortos. Ver `validation.md`.
 
 ---
 
 ## Success Criteria
 
-- [ ] Um `POST /user/contacts/resync` repovoa `whatsmeow_contacts` com a agenda e
+- [x] Um `POST /user/contacts/resync` repovoa `whatsmeow_contacts` com a agenda e
       devolve quantos contatos ficaram no store.
-- [ ] `GET /group/info?resolveBusiness=true` preenche `ContactName` de
+- [x] `GET /group/info?resolveBusiness=true` preenche `ContactName` de
       participantes business que antes voltavam vazios.
-- [ ] Sem `resolveBusiness`, os endpoints de grupo continuam sem tráfego extra.
-- [ ] `go vet && go build && go test ./... -race` verde.
+- [x] Sem `resolveBusiness`, os endpoints de grupo continuam sem tráfego extra.
+- [x] `go vet && go build && go test ./... -race` verde (152 testes de topo, 0 skips).
