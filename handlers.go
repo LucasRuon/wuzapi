@@ -4507,10 +4507,8 @@ func (s *server) ListGroups() http.HandlerFunc {
 			return
 		}
 
-		gc := new(GroupCollection)
-		nameCache := make(map[types.JID]participantNames)
-		for _, info := range resp {
-			gc.Groups = append(gc.Groups, enrichGroupInfo(r.Context(), client, info, nameCache))
+		gc := &GroupCollection{
+			Groups: enrichGroupList(r.Context(), client, resp, businessNameResolverFor(r, client)),
 		}
 
 		responseJson, err := json.Marshal(gc)
@@ -4583,6 +4581,16 @@ const maxBusinessNameLookups = 64
 // updateBusinessName without ever assigning it to the response), so callers read
 // the resolved name back from the contact store.
 type businessNameResolver func(ctx context.Context, jids []types.JID) (map[types.JID]types.UserInfo, error)
+
+// businessNameResolverFor returns the batch resolver only when the request opted
+// in with resolveBusiness=true. Without the opt-in the group endpoints stay
+// local-only, with no extra traffic to WhatsApp.
+func businessNameResolverFor(r *http.Request, client *whatsmeow.Client) businessNameResolver {
+	if r.URL.Query().Get("resolveBusiness") != "true" {
+		return nil
+	}
+	return client.GetUserInfo
+}
 
 // enrichGroupList name-enriches a batch of groups, sharing one name cache across
 // all of them. When resolve is non-nil (the resolveBusiness opt-in), participants
@@ -4805,7 +4813,7 @@ func (s *server) GetGroupInfo() http.HandlerFunc {
 			return
 		}
 
-		enriched := enrichGroupInfo(r.Context(), client, resp, nil)
+		enriched := enrichGroupList(r.Context(), client, []*types.GroupInfo{resp}, businessNameResolverFor(r, client))[0]
 
 		responseJson, err := json.Marshal(enriched)
 

@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"go.mau.fi/whatsmeow"
@@ -279,6 +282,55 @@ func TestEnrichGroupListWithNoGroupsIsANoOp(t *testing.T) {
 	}
 	if len(resolver.batches) != 0 {
 		t.Errorf("resolver batches = %d, want 0", len(resolver.batches))
+	}
+}
+
+// P2 AC-2: only the exact opt-in value turns the lookup on.
+func TestBusinessNameResolverForOnlyOnExactOptIn(t *testing.T) {
+	client := &whatsmeow.Client{}
+	cases := []struct {
+		query string
+		want  bool
+	}{
+		{"", false},
+		{"?resolveBusiness=", false},
+		{"?resolveBusiness=false", false},
+		{"?resolveBusiness=1", false},
+		{"?resolveBusiness=TRUE", false},
+		{"?resolveBusiness=true", true},
+	}
+
+	for _, tc := range cases {
+		req := httptest.NewRequest(http.MethodGet, "/group/info"+tc.query, nil)
+		if got := businessNameResolverFor(req, client) != nil; got != tc.want {
+			t.Errorf("businessNameResolverFor(%q) resolver != nil = %v, want %v", tc.query, got, tc.want)
+		}
+	}
+}
+
+// P2 AC-2: the opt-in does not change how the route itself behaves.
+func TestGroupInfoEndpointAcceptsResolveBusiness(t *testing.T) {
+	s := makeTestServer(t)
+	const token = "tok-group-business"
+	if _, err := s.db.Exec(
+		`INSERT INTO users (id, name, token, connected) VALUES ($1,$2,$3,$4)`,
+		"u-gb", "tester", token, 0); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/group/info?groupJID=120362023605733675@g.us&resolveBusiness=true", nil)
+	req.Header.Set("token", token)
+	rr := httptest.NewRecorder()
+	s.router.ServeHTTP(rr, req)
+
+	if rr.Code == http.StatusNotFound {
+		t.Fatalf("route /group/info not registered (404)")
+	}
+	if rr.Code == http.StatusUnauthorized {
+		t.Fatalf("auth failed for a valid token (401): %s", rr.Body.String())
+	}
+	if rr.Code != http.StatusInternalServerError || !strings.Contains(rr.Body.String(), "no session") {
+		t.Errorf("expected 500 \"no session\"; got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 

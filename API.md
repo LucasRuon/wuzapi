@@ -1148,6 +1148,11 @@ endpoint: _/group/list_
 
 method: **GET**
 
+Optional query parameter:
+
+| Parameter | Value | Effect |
+| --- | --- | --- |
+| `resolveBusiness` | `true` | Looks the WhatsApp Business verified name up for participants left without any name, in one batch query (see [Participant names](#participant-names)) |
 
 ```
 curl -s -X GET -H 'Token: 1234ABCD' http://localhost:8080/group/list 
@@ -1237,6 +1242,11 @@ endpoint: _/group/info_
 
 method: **GET**
 
+Optional query parameter:
+
+| Parameter | Value | Effect |
+| --- | --- | --- |
+| `resolveBusiness` | `true` | Looks the WhatsApp Business verified name up for participants left without any name, in one batch query (see [Participant names](#participant-names)) |
 
 ```
 curl -s -X GET -H 'Token: 1234ABCD' -H 'Content-Type: application/json' --data '{"GroupJID":"120362023605733675@g.us"}' http://localhost:8080/group/info
@@ -1285,6 +1295,35 @@ Response:
   "success": true
 }
 ```
+
+### Participant names
+
+Both group endpoints enrich each participant with the best name available, in
+this order:
+
+| Field | Source | Filled when |
+| --- | --- | --- |
+| `ContactName` | local contact store (`FullName` > `PushName` > `BusinessName` > `FirstName`) | the contact is in the paired phone's address book, has messaged the session, or is a business resolved with `resolveBusiness` |
+| `DisplayName` | push name, or the obfuscated name WhatsApp sends for anonymous community members | the participant has messaged the session at least once |
+| `RedactedPhone` | masked number (`+55∙∙∙∙∙∙∙∙80`) sent by WhatsApp | announcement/community groups only |
+
+All three come from the local contact store, so a participant who is **not** in
+the address book and has **never** sent a message the session received arrives
+with all of them empty — only `PhoneNumber` is known. That is the same thing
+WhatsApp Web shows for an unknown member.
+
+Two ways to get a name for those:
+
+- `POST /user/contacts/resync` — re-syncs the paired phone's address book, which
+  fills `ContactName` for every saved contact.
+- `resolveBusiness=true` — queries WhatsApp for the verified name of the
+  participants still without one. Only WhatsApp Business accounts have a verified
+  name; personal accounts stay empty. Costs one batch query per request, capped at
+  64 numbers, and any failure degrades silently (the response keeps the names it
+  already had).
+
+Push names cannot be fetched on demand by any endpoint: WhatsApp only ships them
+embedded in received messages.
 
 ---
 
