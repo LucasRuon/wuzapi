@@ -1747,6 +1747,12 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			dowebhook = 1
 		}
 		log.Info().Str("labelID", evt.LabelID).Str("jid", evt.JID.String()).Msg("Label association (chat) changed")
+	case *events.Contact:
+		// A full address-book sync (POST /user/contacts/resync) re-emits one of
+		// these per contact. whatsmeow has already written the name to the contact
+		// store by now; there is nothing to publish, so keep it out of the warn
+		// stream instead of drowning the log in "Unhandled event".
+		log.Debug().Str("jid", evt.JID.String()).Msg("Contact updated")
 	default:
 		log.Warn().Str("event", fmt.Sprintf("%+v", evt)).Msg("Unhandled event")
 	}

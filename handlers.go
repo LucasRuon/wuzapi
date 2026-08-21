@@ -36,6 +36,7 @@ import (
 	"go.mau.fi/whatsmeow/proto/waSyncAction"
 
 	"go.mau.fi/whatsmeow/appstate"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
@@ -3657,6 +3658,80 @@ func (s *server) GetContacts() http.HandlerFunc {
 		}
 
 		return
+	}
+}
+
+// errNotConnected marks a request that needs the WhatsApp socket up.
+var errNotConnected = errors.New("not connected")
+
+// contactSyncer is the slice of *whatsmeow.Client that resyncContacts needs.
+type contactSyncer interface {
+	IsConnected() bool
+	FetchAppState(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) error
+}
+
+// resyncContacts forces a full re-fetch of the app-state patch that carries the
+// paired phone's address book (critical_unblock_low), repopulating first_name and
+// full_name in whatsmeow_contacts. That table is the only source the API can
+// recover: push names cannot be re-fetched (WhatsApp only ships them embedded in
+// messages), and the table is scoped by our_jid, so a re-pairing orphans every
+// previously synced contact. Returns how many contacts the store holds after the
+// sync.
+func resyncContacts(ctx context.Context, client contactSyncer, contacts store.ContactStore) (int, error) {
+	if !client.IsConnected() {
+		return 0, errNotConnected
+	}
+	if err := client.FetchAppState(ctx, appstate.WAPatchCriticalUnblockLow, true, false); err != nil {
+		return 0, err
+	}
+	all, err := contacts.GetAllContacts(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return len(all), nil
+}
+
+// formatResyncContactsResult shapes the success payload of POST /user/contacts/resync.
+func formatResyncContactsResult(total int) map[string]interface{} {
+	return map[string]interface{}{
+		"success":  true,
+		"contacts": total,
+	}
+}
+
+// ResyncContacts re-syncs the paired phone's address book so participants that
+// were saved as contacts resolve a name again (see resyncContacts for why this is
+// the only recoverable source).
+func (s *server) ResyncContacts() http.HandlerFunc {
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		txtid := r.Context().Value("userinfo").(Values).Get("Id")
+
+		client := clientManager.GetWhatsmeowClient(txtid)
+		if client == nil {
+			s.Respond(w, r, http.StatusInternalServerError, errors.New("no session"))
+			return
+		}
+
+		// A full address-book sync moves a much bigger patch than the 30s
+		// ResyncLabels budget covers.
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		total, err := resyncContacts(ctx, client, client.Store.Contacts)
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, fmt.Errorf("failed to resync contacts: %w", err))
+			return
+		}
+
+		log.Info().Int("contacts", total).Msg("Contact address book resynced")
+
+		responseJson, err := json.Marshal(formatResyncContactsResult(total))
+		if err != nil {
+			s.Respond(w, r, http.StatusInternalServerError, err)
+		} else {
+			s.Respond(w, r, http.StatusOK, string(responseJson))
+		}
 	}
 }
 

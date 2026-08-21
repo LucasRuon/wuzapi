@@ -643,6 +643,43 @@ Response:
 
 ---
 
+## Resync contacts
+
+Forces a full re-fetch of the app-state patch that carries the paired phone's
+address book (`critical_unblock_low`), repopulating `FirstName`/`FullName` in the
+local contact store. Use it when contacts stop resolving a name — most often after
+a re-pairing, since the contact table is scoped by the paired device's JID.
+
+Only the address book is recoverable this way. Push names cannot be re-fetched:
+WhatsApp only ships them embedded in received messages.
+
+Requires a connected session. The call is synchronous and may take a while on
+large address books.
+
+Endpoint: _/user/contacts/resync_
+
+Method: **POST**
+
+```
+curl -s -X POST -H 'Token: 1234ABCD' http://localhost:8080/user/contacts/resync
+```
+
+Response:
+
+```json
+{
+  "code": 200,
+  "data": {
+    "success": true,
+    "contacts": 482
+  }
+}
+```
+
+`contacts` is how many contacts the local store holds after the sync.
+
+---
+
 ## Get Privacy Settings
 
 Returns the account's current privacy settings.

@@ -143,6 +143,7 @@ func (s *server) routes() {
 	s.router.Handle("/user/check", c.Then(s.CheckUser())).Methods("POST")
 	s.router.Handle("/user/avatar", c.Then(s.GetAvatar())).Methods("POST")
 	s.router.Handle("/user/contacts", c.Then(s.GetContacts())).Methods("GET")
+	s.router.Handle("/user/contacts/resync", c.Then(s.ResyncContacts())).Methods("POST")
 	s.router.Handle("/user/block", c.Then(s.BlockUser())).Methods("POST")
 	s.router.Handle("/user/unblock", c.Then(s.UnblockUser())).Methods("POST")
 	s.router.Handle("/user/blocklist", c.Then(s.GetBlocklist())).Methods("GET")
