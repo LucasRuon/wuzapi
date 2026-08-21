@@ -4572,6 +4572,102 @@ func enrichGroupInfo(ctx context.Context, client *whatsmeow.Client, groupInfo *t
 	return out
 }
 
+// maxBusinessNameLookups caps how many numbers a single request sends in the
+// batch lookup. A usync carrying hundreds of numbers is exactly the pattern
+// WhatsApp scores as suspicious, and 64 already covers a whole typical group.
+const maxBusinessNameLookups = 64
+
+// businessNameResolver queries WhatsApp about the given phone JIDs.
+// client.GetUserInfo is the production implementation. It does NOT return the
+// verified name (whatsmeow user.go:232-252 parses it and hands it straight to
+// updateBusinessName without ever assigning it to the response), so callers read
+// the resolved name back from the contact store.
+type businessNameResolver func(ctx context.Context, jids []types.JID) (map[types.JID]types.UserInfo, error)
+
+// enrichGroupList name-enriches a batch of groups, sharing one name cache across
+// all of them. When resolve is non-nil (the resolveBusiness opt-in), participants
+// left without any name get one batch lookup against WhatsApp; with nil it is
+// purely local, exactly as before.
+func enrichGroupList(ctx context.Context, client *whatsmeow.Client, infos []*types.GroupInfo, resolve businessNameResolver) []GroupInfoWithNames {
+	nameCache := make(map[types.JID]participantNames)
+	out := make([]GroupInfoWithNames, 0, len(infos))
+	for _, info := range infos {
+		out = append(out, enrichGroupInfo(ctx, client, info, nameCache))
+	}
+	resolveMissingBusinessNames(ctx, client, resolve, out)
+	return out
+}
+
+// resolveMissingBusinessNames fills ContactName of participants that ended up
+// with no name at all, using the verified name of business accounts. It is the
+// only name the API can fetch on demand: push names arrive embedded in messages
+// and the address book only through an app-state sync.
+//
+// Best effort by design (AD-002 reserves fail-closed for protective checks): any
+// failure leaves the response with the names it already had.
+func resolveMissingBusinessNames(ctx context.Context, client *whatsmeow.Client, resolve businessNameResolver, groups []GroupInfoWithNames) {
+	if resolve == nil || client == nil || client.Store == nil || client.Store.Contacts == nil {
+		return
+	}
+
+	// usync identifies a contact by phone number, so an LID-only participant has
+	// nothing to query with.
+	missing := make([]types.JID, 0)
+	seen := make(map[types.JID]bool)
+	for i := range groups {
+		for j := range groups[i].Participants {
+			participant := &groups[i].Participants[j]
+			if participant.ContactName != "" || participant.PhoneNumber.IsEmpty() || seen[participant.PhoneNumber] {
+				continue
+			}
+			seen[participant.PhoneNumber] = true
+			missing = append(missing, participant.PhoneNumber)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	if len(missing) > maxBusinessNameLookups {
+		log.Warn().
+			Int("limit", maxBusinessNameLookups).
+			Int("skipped", len(missing)-maxBusinessNameLookups).
+			Msg("too many group participants without a name; resolving the first batch only")
+		missing = missing[:maxBusinessNameLookups]
+	}
+
+	if _, err := resolve(ctx, missing); err != nil {
+		log.Debug().Err(err).Msg("could not resolve business names of group participants")
+		return
+	}
+
+	resolved := make(map[types.JID]string, len(missing))
+	for _, jid := range missing {
+		contact, err := client.Store.Contacts.GetContact(ctx, jid)
+		if err != nil {
+			log.Debug().Err(err).Str("jid", jid.String()).Msg("could not read resolved business name")
+			continue
+		}
+		if contact.Found && contact.BusinessName != "" {
+			resolved[jid] = contact.BusinessName
+		}
+	}
+	if len(resolved) == 0 {
+		return
+	}
+
+	for i := range groups {
+		for j := range groups[i].Participants {
+			participant := &groups[i].Participants[j]
+			if participant.ContactName != "" {
+				continue
+			}
+			if name, ok := resolved[participant.PhoneNumber]; ok {
+				participant.ContactName = name
+			}
+		}
+	}
+}
+
 func fillGroupParticipantPhoneNumbers(ctx context.Context, client *whatsmeow.Client, groupInfo *types.GroupInfo) {
 	if client == nil || client.Store == nil || client.Store.LIDs == nil || groupInfo == nil {
 		return
