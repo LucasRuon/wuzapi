@@ -174,6 +174,72 @@ func TestResolveMissingBusinessNamesAppliesToEveryOccurrenceOfAPhone(t *testing.
 	}
 }
 
+// Edge case: when a shared phone number already named one participant, that name
+// is preserved — only the nameless one takes the business name.
+func TestResolveMissingBusinessNamesNeverOverwritesAnExistingName(t *testing.T) {
+	phone := types.NewJID("5511777777777", types.DefaultUserServer)
+	namedLID := types.NewJID("11111", types.HiddenUserServer)
+	namelessLID := types.NewJID("22222", types.HiddenUserServer)
+
+	client, resolver := newBusinessResolverClient(
+		// The first participant resolves a name through its own LID.
+		map[string]types.ContactInfo{namedLID.String(): {Found: true, FullName: "João Silva"}},
+		map[string]string{phone.String(): "Padaria do Zé LTDA"},
+	)
+
+	groups := enrichGroupList(context.Background(), client, []*types.GroupInfo{
+		groupWith(
+			types.GroupParticipant{JID: namedLID, LID: namedLID, PhoneNumber: phone},
+			types.GroupParticipant{JID: namelessLID, LID: namelessLID, PhoneNumber: phone},
+		),
+	}, resolver.resolve)
+
+	if got := groups[0].Participants[0].ContactName; got != "João Silva" {
+		t.Errorf("ContactName[0] = %q, want %q (an existing name is never overwritten)", got, "João Silva")
+	}
+	if got := groups[0].Participants[1].ContactName; got != "Padaria do Zé LTDA" {
+		t.Errorf("ContactName[1] = %q, want %q", got, "Padaria do Zé LTDA")
+	}
+}
+
+// Edge case: a failed lookup resolved nothing, so there is nothing to read back.
+func TestResolveMissingBusinessNamesSkipsStoreReadOnResolverError(t *testing.T) {
+	business := types.NewJID("5511777777777", types.DefaultUserServer)
+	contacts := map[string]types.ContactInfo{}
+	calls := 0
+	client := &whatsmeow.Client{
+		Store: &store.Device{
+			Contacts: countingContactStore{
+				fakeContactStore: fakeContactStore{contactByJID: contacts},
+				calls:            &calls,
+			},
+		},
+	}
+	resolver := &recordingBusinessResolver{
+		err:   errors.New("usync failed"),
+		names: map[string]string{business.String(): "Padaria do Zé LTDA"},
+		store: fakeContactStore{contactByJID: contacts},
+	}
+
+	// Already-enriched groups, so the counter only sees the read-back this
+	// function does — not the lookups enrichGroupInfo performs.
+	groups := []GroupInfoWithNames{{
+		GroupInfo: &types.GroupInfo{},
+		Participants: []ParticipantWithName{
+			{GroupParticipant: types.GroupParticipant{JID: business, PhoneNumber: business}},
+		},
+	}}
+
+	resolveMissingBusinessNames(context.Background(), client, resolver.resolve, groups)
+
+	if calls != 0 {
+		t.Errorf("GetContact calls = %d, want 0 (a failed lookup resolved nothing to read back)", calls)
+	}
+	if got := groups[0].Participants[0].ContactName; got != "" {
+		t.Errorf("ContactName = %q, want empty", got)
+	}
+}
+
 // P2 AC-6: above the cap only the first 64 are queried; the rest stay nameless.
 func TestResolveMissingBusinessNamesCapsTheBatch(t *testing.T) {
 	const total = maxBusinessNameLookups + 6
@@ -279,6 +345,10 @@ func TestEnrichGroupListWithNoGroupsIsANoOp(t *testing.T) {
 
 	if len(groups) != 0 {
 		t.Errorf("groups = %d, want 0", len(groups))
+	}
+	// Edge case: an empty group list must marshal as [] in /group/list, never null.
+	if groups == nil {
+		t.Errorf("groups = nil, want an empty slice (Groups must serialize as [], not null)")
 	}
 	if len(resolver.batches) != 0 {
 		t.Errorf("resolver batches = %d, want 0", len(resolver.batches))
