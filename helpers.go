@@ -256,6 +256,16 @@ func callHook(myurl string, payload map[string]string, userID string) {
 	callHookWithHmac(myurl, payload, userID, nil)
 }
 
+// isRetryableWebhookStatus reports whether a non-2xx webhook response is worth
+// retrying: 5xx and the transient 4xx (408 timeout, 429 rate limit). Every other
+// 4xx (400, 401, 403, 404, 413...) will fail the same way on the next attempt.
+func isRetryableWebhookStatus(status int) bool {
+	if status >= 500 {
+		return true
+	}
+	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests
+}
+
 // webhook for regular messages with HMAC
 func callHookWithHmac(myurl string, payload map[string]string, userID string, encryptedHmacKey []byte) {
 	log.Info().Str("url", myurl).Str("userID", userID).Msg("Sending POST to client with retry logic")
@@ -370,7 +380,10 @@ func callHookWithHmac(myurl string, payload map[string]string, userID string, en
 				Str("url", myurl).
 				Msg("Webhook failed due to non-2xx status code")
 
-			if !*webhookRetryEnabled {
+			// 4xx (exceto 408/429) e resposta definitiva do receptor: repetir o
+			// mesmo payload so segura memoria por minutos (413 em midia base64
+			// derrubou o processo por OOM em 11/09/2026).
+			if !*webhookRetryEnabled || !isRetryableWebhookStatus(resp.StatusCode()) {
 				break
 			}
 			continue

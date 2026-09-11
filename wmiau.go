@@ -107,7 +107,9 @@ func sendToUserWebHookWithHmac(webhookurl string, path string, jsonData []byte, 
 		"instanceName": instance_name,
 	}
 
-	log.Debug().Interface("webhookData", data).Msg("Data being sent to webhook")
+	// Nao serializar o payload no log: com midia em base64 isso duplica dezenas de
+	// MB por evento no stdout. Loga so o tamanho e a instancia.
+	log.Debug().Str("instanceName", instance_name).Str("userID", userID).Int("jsonBytes", len(jsonData)).Msg("Data being sent to webhook")
 
 	if webhookurl != "" {
 		log.Info().Str("url", webhookurl).Msg("Calling user webhook")
