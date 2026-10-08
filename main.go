@@ -500,6 +500,8 @@ func main() {
 	s.governor.startSendEventPruner()
 	s.routes()
 
+	// Antes de reconectar as sessões: o handshake delas já usa a versão lida.
+	startWAVersionRefresher()
 	s.connectOnStartup()
 
 	if serverMode == Stdio {
