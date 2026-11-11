@@ -399,20 +399,21 @@ func brazilianMobileVariants(digits string) []string {
 	return nil
 }
 
-// registeredPhone devolve o número de telefone registrado de uma resposta do
-// IsOnWhatsApp. O WhatsApp passou a devolver o LID (@lid) como JID canônico para
-// muitos contatos; nesse caso o User do JID é o LID, não o telefone, e montar um
-// JID @s.whatsapp.net com ele faz o envio falhar com "no LID found for
-// <lid>@s.whatsapp.net". O telefone consultado continua no Query.
-func registeredPhone(item types.IsOnWhatsAppResponse) string {
-	if item.JID.Server == types.DefaultUserServer && item.JID.User != "" {
-		return item.JID.User
+// resolveLIDRecipient decide o destino quando o IsOnWhatsApp devolve só o LID
+// (@lid) como JID canônico. Montar <lid>@s.whatsapp.net faz o envio falhar com
+// "no LID found for ...", e o Query da resposta também não é confiável: o
+// servidor ecoa uma das variantes consultadas, não necessariamente a registrada
+// (consultar 554199198525 e 5541999198525 devolve Query "5541999198525" para um
+// número registrado sem o 9). Usa o telefone que o store já associa ao LID; sem
+// esse mapeamento, envia direto para o LID, que o whatsmeow entrega sem telefone.
+func resolveLIDRecipient(ctx context.Context, client *whatsmeow.Client, lid types.JID) types.JID {
+	if client != nil && client.Store != nil && client.Store.LIDs != nil {
+		pn, err := client.Store.LIDs.GetPNForLID(ctx, lid)
+		if err == nil && pn.User != "" {
+			return types.NewJID(pn.User, types.DefaultUserServer)
+		}
 	}
-	q := strings.TrimPrefix(item.Query, "+")
-	if i := strings.IndexByte(q, '@'); i >= 0 {
-		q = q[:i]
-	}
-	return q
+	return types.NewJID(lid.User, types.HiddenUserServer)
 }
 
 // normalizeBrazilianJID resolve o nono dígito de um celular brasileiro consultando
@@ -445,12 +446,16 @@ func normalizeBrazilianJID(client *whatsmeow.Client, recipient types.JID) types.
 
 	var resolved *types.JID
 	for _, item := range resp {
-		phone := registeredPhone(item)
-		if !item.IsIn || phone == "" {
+		if !item.IsIn || item.JID.User == "" {
 			continue
 		}
-		j := types.NewJID(phone, types.DefaultUserServer)
-		if phone == digits {
+		if item.JID.Server == types.HiddenUserServer {
+			j := resolveLIDRecipient(ctx, client, item.JID)
+			resolved = &j
+			break
+		}
+		j := types.NewJID(item.JID.User, types.DefaultUserServer)
+		if item.JID.User == digits {
 			resolved = &j // bateu com o número original: preferência máxima
 			break
 		}

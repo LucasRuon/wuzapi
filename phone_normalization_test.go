@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"reflect"
 	"testing"
 
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -60,32 +64,53 @@ func TestBrazilianMobileVariants(t *testing.T) {
 	}
 }
 
-func TestRegisteredPhone(t *testing.T) {
+// fakeLIDStore só implementa GetPNForLID; os demais métodos da interface não
+// são usados por resolveLIDRecipient.
+type fakeLIDStore struct {
+	store.LIDStore
+	pn  types.JID
+	err error
+}
+
+func (f fakeLIDStore) GetPNForLID(ctx context.Context, lid types.JID) (types.JID, error) {
+	return f.pn, f.err
+}
+
+func TestResolveLIDRecipient(t *testing.T) {
+	lid := types.NewJID("78576594497566", types.HiddenUserServer)
+	clientWith := func(f fakeLIDStore) *whatsmeow.Client {
+		return &whatsmeow.Client{Store: &store.Device{LIDs: f}}
+	}
 	cases := []struct {
-		name string
-		item types.IsOnWhatsAppResponse
-		want string
+		name   string
+		client *whatsmeow.Client
+		want   types.JID
 	}{
 		{
-			name: "JID de telefone: usa o User do JID",
-			item: types.IsOnWhatsAppResponse{Query: "+5541999198525", JID: types.NewJID("554199198525", types.DefaultUserServer), IsIn: true},
-			want: "554199198525",
+			name:   "LID mapeado no store: usa o telefone registrado",
+			client: clientWith(fakeLIDStore{pn: types.NewJID("554199198525", types.DefaultUserServer)}),
+			want:   types.NewJID("554199198525", types.DefaultUserServer),
 		},
 		{
-			name: "JID @lid: usa o telefone do Query, nunca o LID",
-			item: types.IsOnWhatsAppResponse{Query: "+5541992439878", JID: types.NewJID("78460613578766", types.HiddenUserServer), IsIn: true},
-			want: "5541992439878",
+			name:   "LID sem mapeamento: envia direto para o LID",
+			client: clientWith(fakeLIDStore{}),
+			want:   lid,
 		},
 		{
-			name: "Query sem + e com sufixo de servidor",
-			item: types.IsOnWhatsAppResponse{Query: "5541992439878@s.whatsapp.net", JID: types.NewJID("78460613578766", types.HiddenUserServer), IsIn: true},
-			want: "5541992439878",
+			name:   "erro no store: envia direto para o LID",
+			client: clientWith(fakeLIDStore{err: errors.New("db")}),
+			want:   lid,
+		},
+		{
+			name:   "sem client: envia direto para o LID",
+			client: nil,
+			want:   lid,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := registeredPhone(tc.item); got != tc.want {
-				t.Errorf("registeredPhone() = %q, want %q", got, tc.want)
+			if got := resolveLIDRecipient(context.Background(), tc.client, lid); got != tc.want {
+				t.Errorf("resolveLIDRecipient() = %v, want %v", got, tc.want)
 			}
 		})
 	}
