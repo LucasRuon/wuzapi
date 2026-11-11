@@ -399,6 +399,22 @@ func brazilianMobileVariants(digits string) []string {
 	return nil
 }
 
+// registeredPhone devolve o número de telefone registrado de uma resposta do
+// IsOnWhatsApp. O WhatsApp passou a devolver o LID (@lid) como JID canônico para
+// muitos contatos; nesse caso o User do JID é o LID, não o telefone, e montar um
+// JID @s.whatsapp.net com ele faz o envio falhar com "no LID found for
+// <lid>@s.whatsapp.net". O telefone consultado continua no Query.
+func registeredPhone(item types.IsOnWhatsAppResponse) string {
+	if item.JID.Server == types.DefaultUserServer && item.JID.User != "" {
+		return item.JID.User
+	}
+	q := strings.TrimPrefix(item.Query, "+")
+	if i := strings.IndexByte(q, '@'); i >= 0 {
+		q = q[:i]
+	}
+	return q
+}
+
 // normalizeBrazilianJID resolve o nono dígito de um celular brasileiro consultando
 // o WhatsApp (IsOnWhatsApp) e retornando o JID canônico realmente registrado.
 // Faz fallback para o recipient original sempre que não houver o que resolver, a
@@ -429,11 +445,12 @@ func normalizeBrazilianJID(client *whatsmeow.Client, recipient types.JID) types.
 
 	var resolved *types.JID
 	for _, item := range resp {
-		if !item.IsIn || item.JID.User == "" {
+		phone := registeredPhone(item)
+		if !item.IsIn || phone == "" {
 			continue
 		}
-		j := types.NewJID(item.JID.User, types.DefaultUserServer)
-		if item.JID.User == digits {
+		j := types.NewJID(phone, types.DefaultUserServer)
+		if phone == digits {
 			resolved = &j // bateu com o número original: preferência máxima
 			break
 		}

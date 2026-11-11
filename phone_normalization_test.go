@@ -3,6 +3,8 @@ package main
 import (
 	"reflect"
 	"testing"
+
+	"go.mau.fi/whatsmeow/types"
 )
 
 func TestBrazilianMobileVariants(t *testing.T) {
@@ -53,6 +55,37 @@ func TestBrazilianMobileVariants(t *testing.T) {
 			got := brazilianMobileVariants(tc.input)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("brazilianMobileVariants(%q) = %v, want %v", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRegisteredPhone(t *testing.T) {
+	cases := []struct {
+		name string
+		item types.IsOnWhatsAppResponse
+		want string
+	}{
+		{
+			name: "JID de telefone: usa o User do JID",
+			item: types.IsOnWhatsAppResponse{Query: "+5541999198525", JID: types.NewJID("554199198525", types.DefaultUserServer), IsIn: true},
+			want: "554199198525",
+		},
+		{
+			name: "JID @lid: usa o telefone do Query, nunca o LID",
+			item: types.IsOnWhatsAppResponse{Query: "+5541992439878", JID: types.NewJID("78460613578766", types.HiddenUserServer), IsIn: true},
+			want: "5541992439878",
+		},
+		{
+			name: "Query sem + e com sufixo de servidor",
+			item: types.IsOnWhatsAppResponse{Query: "5541992439878@s.whatsapp.net", JID: types.NewJID("78460613578766", types.HiddenUserServer), IsIn: true},
+			want: "5541992439878",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := registeredPhone(tc.item); got != tc.want {
+				t.Errorf("registeredPhone() = %q, want %q", got, tc.want)
 			}
 		})
 	}
